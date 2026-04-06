@@ -39,6 +39,9 @@ Choose a coder mode based on user preference or task complexity:
 - **haiku** – Invoke the `coder` subagent (Claude Haiku). Pass the Module Contract and the hardware specification. The agent returns a complete Verilog module.
 - **codev** – Call `call_codev(prompt, server_url)` inside the REPL. This sends the specification to `zhuyaoyu/CodeV-R1-RL-Qwen-7B` running via vllm and returns only the extracted Verilog code (reasoning and tags are stripped automatically).
 
+**RLM Execution Rule**:
+The Root Agent is **FORBIDDEN** from generating Verilog code blocks in its main response.
+
 ### 4. Verification (ALWAYS required after writing any .v file)
 
 After writing **any** `.v` file, immediately verify it:
