@@ -1,31 +1,19 @@
 #!/usr/bin/env python3
-"""Persistent mini-REPL for RLM-style workflows in Claude Code.
+"""Persistent mini-REPL for RLM-style Verilog hardware generation in Claude Code.
 
-This script provides a *stateful* Python environment across invocations by
+This script provides a stateful Python environment across invocations by
 saving a pickle file to disk. It is intentionally small and dependency-free.
 
-Typical flow:
-  1) Initialise context:
-       python rlm_repl.py init path/to/context.txt
-  2) Execute code repeatedly (state persists):
-       python rlm_repl.py exec -c 'print(len(content))'
-       python rlm_repl.py exec <<'PYCODE'
-       # you can write multi-line code
-       hits = grep('TODO')
-       print(hits[:3])
-       PYCODE
+Commands:
+  exec    - Execute Python code with persisted state
+  verify  - Run iverilog syntax/elaboration check on a Verilog file
+  status  - Show current state summary
+  reset   - Delete the current state file
 
-The script injects these variables into the exec environment:
-  - context: dict with keys {path, loaded_at, content}
-  - content: string alias for context['content']
-  - buffers: list[str] for storing intermediate text results
-
-It also injects helpers:
-  - peek(start=0, end=1000) -> str
-  - grep(pattern, max_matches=20, window=120, flags=0) -> list[dict]
-  - chunk_indices(size=200000, overlap=0) -> list[(start,end)]
-  - write_chunks(out_dir, size=200000, overlap=0, prefix='chunk') -> list[str]
-  - add_buffer(text: str) -> None
+Helpers injected into the exec environment:
+  - buffers: list[str] for storing intermediate results
+  - verify_verilog(file_path) -> dict
+  - call_codev(prompt, server_url, model="zhuyaoyu/CodeV-R1-RL-Qwen-7B") -> str
 
 Security note:
   This runs arbitrary Python via exec. Treat it like running code you wrote.
@@ -35,13 +23,15 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import pickle
 import re
+import subprocess
 import sys
 import textwrap
-import time
 import traceback
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -49,6 +39,17 @@ from typing import Any, Dict, List, Tuple
 
 DEFAULT_STATE_PATH = Path(".claude/rlm_state/state.pkl")
 DEFAULT_MAX_OUTPUT_CHARS = 8000
+
+CODEV_SYSTEM_PROMPT = (
+    "You are a helpful assistant. The assistant first thinks about the reasoning "
+    "process in the mind and then provides the user with the answer. The reasoning "
+    "process and answer are enclosed within <think> </think> and<answer> </answer> "
+    "tags, respectively, i.e., <think> reasoning process here </think>"
+    "<answer> answer here </answer>.  Now the user asks you to write verilog code. "
+    "After thinking, when you finally reach a conclusion, enclose the final verilog "
+    "code in ```verilog ``` within <answer> </answer> tags. i.e., <answer> ```verilog\n"
+    " module top_module(in, out, ...) ... ``` </answer>."
+)
 
 
 class RlmReplError(RuntimeError):
@@ -61,9 +62,7 @@ def _ensure_parent_dir(path: Path) -> None:
 
 def _load_state(state_path: Path) -> Dict[str, Any]:
     if not state_path.exists():
-        raise RlmReplError(
-            f"No state found at {state_path}. Run: python rlm_repl.py init <context_path>"
-        )
+        return {"version": 1, "buffers": [], "globals": {}}
     with state_path.open("rb") as f:
         state = pickle.load(f)
     if not isinstance(state, dict):
@@ -77,19 +76,6 @@ def _save_state(state: Dict[str, Any], state_path: Path) -> None:
     with tmp_path.open("wb") as f:
         pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
     tmp_path.replace(state_path)
-
-
-def _read_text_file(path: Path, max_bytes: int | None = None) -> str:
-    if not path.exists():
-        raise RlmReplError(f"Context file does not exist: {path}")
-    data: bytes
-    with path.open("rb") as f:
-        data = f.read() if max_bytes is None else f.read(max_bytes)
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        # Fall back to a lossy decode that will not crash.
-        return data.decode("utf-8", errors="replace")
 
 
 def _truncate(s: str, max_chars: int) -> str:
@@ -119,118 +105,130 @@ def _filter_pickleable(d: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     return kept, dropped
 
 
-def _make_helpers(context_ref: Dict[str, Any], buffers_ref: List[str]):
-    # These close over context_ref/buffers_ref so changes persist.
-    def peek(start: int = 0, end: int = 1000) -> str:
-        content = context_ref.get("content", "")
-        return content[start:end]
+# ---------------------------------------------------------------------------
+# Core Verilog helpers (also injected into exec environment)
+# ---------------------------------------------------------------------------
 
-    def grep(
-        pattern: str,
-        max_matches: int = 20,
-        window: int = 120,
-        flags: int = 0,
-    ) -> List[Dict[str, Any]]:
-        content = context_ref.get("content", "")
-        out: List[Dict[str, Any]] = []
-        for m in re.finditer(pattern, content, flags):
-            start, end = m.span()
-            snippet_start = max(0, start - window)
-            snippet_end = min(len(content), end + window)
-            out.append(
-                {
-                    "match": m.group(0),
-                    "span": (start, end),
-                    "snippet": content[snippet_start:snippet_end],
-                }
-            )
-            if len(out) >= max_matches:
-                break
-        return out
+def verify_verilog(file_path: str) -> Dict[str, Any]:
+    """Run ``iverilog -t null`` on *file_path* and return a result dict.
 
-    def chunk_indices(size: int = 200_000, overlap: int = 0) -> List[Tuple[int, int]]:
-        if size <= 0:
-            raise ValueError("size must be > 0")
-        if overlap < 0:
-            raise ValueError("overlap must be >= 0")
-        if overlap >= size:
-            raise ValueError("overlap must be < size")
+    Returns:
+        {
+            "success": bool,
+            "returncode": int,
+            "stdout": str,
+            "stderr": str,
+        }
 
-        content = context_ref.get("content", "")
-        n = len(content)
-        spans: List[Tuple[int, int]] = []
-        step = size - overlap
-        for start in range(0, n, step):
-            end = min(n, start + size)
-            spans.append((start, end))
-            if end >= n:
-                break
-        return spans
-
-    def write_chunks(
-        out_dir: str | os.PathLike,
-        size: int = 200_000,
-        overlap: int = 0,
-        prefix: str = "chunk",
-        encoding: str = "utf-8",
-    ) -> List[str]:
-        content = context_ref.get("content", "")
-        spans = chunk_indices(size=size, overlap=overlap)
-        out_path = Path(out_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        paths: List[str] = []
-        for i, (s, e) in enumerate(spans):
-            p = out_path / f"{prefix}_{i:04d}.txt"
-            p.write_text(content[s:e], encoding=encoding)
-            paths.append(str(p))
-        return paths
-
-    def add_buffer(text: str) -> None:
-        buffers_ref.append(str(text))
-
+    A ``"success": true`` result means the file compiled without errors.
+    If ``"success": false``, pass ``"stderr"`` to the Coder sub-agent for
+    correction.
+    """
+    result = subprocess.run(
+        ["iverilog", "-t", "null", file_path],
+        capture_output=True,
+        text=True,
+    )
     return {
-        "peek": peek,
-        "grep": grep,
-        "chunk_indices": chunk_indices,
-        "write_chunks": write_chunks,
-        "add_buffer": add_buffer,
+        "success": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
     }
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    state_path = Path(args.state)
-    ctx_path = Path(args.context)
+def call_codev(
+    prompt: str,
+    server_url: str,
+    model: str = "zhuyaoyu/CodeV-R1-RL-Qwen-7B",
+) -> str:
+    """Call CodeV via vllm's OpenAI-compatible API and return only the Verilog code.
 
-    content = _read_text_file(ctx_path, max_bytes=args.max_bytes)
-    state: Dict[str, Any] = {
-        "version": 1,
-        "context": {
-            "path": str(ctx_path),
-            "loaded_at": time.time(),
-            "content": content,
-        },
-        "buffers": [],
-        "globals": {},
+    The function strictly parses the model's response to extract code within
+    the ``\`\`\`verilog`` block inside the ``<answer>`` tags.  The ``<think>``
+    reasoning block is discarded to prevent compiler errors.
+
+    Args:
+        prompt:     Natural-language hardware specification.
+        server_url: Base URL of the vllm server (e.g. "http://localhost:8000").
+        model:      Model name served by vllm.
+
+    Returns:
+        The raw Verilog source as a string (no markdown fences, no tags).
+
+    Raises:
+        ValueError: If the model response cannot be parsed.
+        urllib.error.URLError: If the vllm server is unreachable.
+    """
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": CODEV_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 4096,
     }
-    _save_state(state, state_path)
 
-    print(f"Initialised RLM REPL state at: {state_path}")
-    print(f"Loaded context: {ctx_path} ({len(content):,} chars)")
-    return 0
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{server_url.rstrip('/')}/v1/chat/completions",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req) as resp:
+        response = json.loads(resp.read().decode("utf-8"))
+
+    full_text = response["choices"][0]["message"]["content"]
+
+    # Extract content inside <answer> tags only (discards <think> reasoning).
+    answer_match = re.search(r"<answer>(.*?)</answer>", full_text, re.DOTALL)
+    if not answer_match:
+        raise ValueError(
+            "No <answer> tags found in CodeV response.\n"
+            f"Raw output (first 500 chars):\n{full_text[:500]}"
+        )
+
+    answer_content = answer_match.group(1)
+
+    # Extract the Verilog code block inside the answer.
+    code_match = re.search(r"```verilog\s*(.*?)\s*```", answer_content, re.DOTALL)
+    if not code_match:
+        raise ValueError(
+            "No ```verilog block found within <answer> tags.\n"
+            f"Answer content:\n{answer_content[:500]}"
+        )
+
+    return code_match.group(1).strip()
+
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    result = verify_verilog(args.file)
+    if result["success"]:
+        print(f"OK: {args.file} compiled cleanly.")
+    else:
+        print(f"FAIL: {args.file} has errors (returncode={result['returncode']}).")
+    if result["stdout"]:
+        sys.stdout.write(result["stdout"])
+    if result["stderr"]:
+        sys.stderr.write(result["stderr"])
+    return 0 if result["success"] else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     state = _load_state(Path(args.state))
-    ctx = state.get("context", {})
-    content = ctx.get("content", "")
     buffers = state.get("buffers", [])
     g = state.get("globals", {})
 
     print("RLM REPL status")
-    print(f"  State file: {args.state}")
-    print(f"  Context path: {ctx.get('path')}")
-    print(f"  Context chars: {len(content):,}")
-    print(f"  Buffers: {len(buffers)}")
+    print(f"  State file : {args.state}")
+    print(f"  Buffers    : {len(buffers)}")
     print(f"  Persisted vars: {len(g)}")
     if args.show_vars and g:
         for k in sorted(g.keys()):
@@ -248,30 +246,16 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_export_buffers(args: argparse.Namespace) -> int:
-    state = _load_state(Path(args.state))
-    buffers = state.get("buffers", [])
-    out_path = Path(args.out)
-    _ensure_parent_dir(out_path)
-    out_path.write_text("\n\n".join(str(b) for b in buffers), encoding="utf-8")
-    print(f"Wrote {len(buffers)} buffers to: {out_path}")
-    return 0
-
-
 def cmd_exec(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
     state = _load_state(state_path)
 
-    ctx = state.get("context")
-    if not isinstance(ctx, dict) or "content" not in ctx:
-        raise RlmReplError("State is missing a valid 'context'. Re-run init.")
-
-    buffers = state.setdefault("buffers", [])
+    buffers: List[str] = state.setdefault("buffers", [])
     if not isinstance(buffers, list):
         buffers = []
         state["buffers"] = buffers
 
-    persisted = state.setdefault("globals", {})
+    persisted: Dict[str, Any] = state.setdefault("globals", {})
     if not isinstance(persisted, dict):
         persisted = {}
         state["globals"] = persisted
@@ -280,45 +264,29 @@ def cmd_exec(args: argparse.Namespace) -> int:
     if code is None:
         code = sys.stdin.read()
 
-    # Build execution environment.
-    # Start from persisted variables, then inject context, buffers and helpers.
+    # Build execution environment: persisted vars + injected helpers.
     env: Dict[str, Any] = dict(persisted)
-    env["context"] = ctx
-    env["content"] = ctx.get("content", "")
     env["buffers"] = buffers
+    env["verify_verilog"] = verify_verilog
+    env["call_codev"] = call_codev
 
-    helpers = _make_helpers(ctx, buffers)
-    env.update(helpers)
+    injected_keys = {"__builtins__", "buffers", "verify_verilog", "call_codev"}
 
-    # Capture output.
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
 
     try:
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            exec(code, env, env)
+            exec(code, env, env)  # noqa: S102
     except Exception:
         traceback.print_exc(file=stderr_buf)
 
-    # Pull back possibly mutated context/buffers.
-    maybe_ctx = env.get("context")
-    if isinstance(maybe_ctx, dict) and "content" in maybe_ctx:
-        state["context"] = maybe_ctx
-        ctx = maybe_ctx
-
+    # Pull back possibly mutated buffers.
     maybe_buffers = env.get("buffers")
     if isinstance(maybe_buffers, list):
         state["buffers"] = maybe_buffers
-        buffers = maybe_buffers
 
-    # Persist any new variables, excluding injected keys.
-    injected_keys = {
-        "__builtins__",
-        "context",
-        "content",
-        "buffers",
-        *helpers.keys(),
-    }
+    # Persist any new variables (excluding injected keys).
     to_persist = {k: v for k, v in env.items() if k not in injected_keys}
     filtered, dropped = _filter_pickleable(to_persist)
     state["globals"] = filtered
@@ -330,16 +298,19 @@ def cmd_exec(args: argparse.Namespace) -> int:
 
     if dropped and args.warn_unpickleable:
         msg = "Dropped unpickleable variables: " + ", ".join(dropped)
-        err = (err + ("\n" if err else "") + msg + "\n")
+        err = err + ("\n" if err else "") + msg + "\n"
 
     if out:
         sys.stdout.write(_truncate(out, args.max_output_chars))
-
     if err:
         sys.stderr.write(_truncate(err, args.max_output_chars))
 
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -347,15 +318,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent(
             """\
-            Persistent mini-REPL for RLM-style workflows.
+            Persistent mini-REPL for RLM Verilog hardware generation.
 
             Examples:
-              python rlm_repl.py init context.txt
-              python rlm_repl.py status
-              python rlm_repl.py exec -c "print(len(content))"
+              python rlm_repl.py verify path/to/top_module.v
+              python rlm_repl.py exec -c "result = verify_verilog('top.v'); print(result)"
               python rlm_repl.py exec <<'PY'
-              print(peek(0, 2000))
+              code = call_codev('implement a 4-bit adder', 'http://localhost:8000')
+              print(code)
               PY
+              python rlm_repl.py status
+              python rlm_repl.py reset
             """
         ),
     )
@@ -367,15 +340,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init", help="Initialise state from a context file")
-    p_init.add_argument("context", help="Path to the context file")
-    p_init.add_argument(
-        "--max-bytes",
-        type=int,
-        default=None,
-        help="Optional cap on bytes read from the context file",
-    )
-    p_init.set_defaults(func=cmd_init)
+    p_verify = sub.add_parser("verify", help="Run iverilog check on a Verilog file")
+    p_verify.add_argument("file", help="Path to the .v file to verify")
+    p_verify.set_defaults(func=cmd_verify)
 
     p_status = sub.add_parser("status", help="Show current state summary")
     p_status.add_argument(
@@ -385,12 +352,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_reset = sub.add_parser("reset", help="Delete the current state file")
     p_reset.set_defaults(func=cmd_reset)
-
-    p_export = sub.add_parser(
-        "export-buffers", help="Export buffers list to a text file"
-    )
-    p_export.add_argument("out", help="Output file path")
-    p_export.set_defaults(func=cmd_export_buffers)
 
     p_exec = sub.add_parser("exec", help="Execute Python code with persisted state")
     p_exec.add_argument(
@@ -403,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-output-chars",
         type=int,
         default=DEFAULT_MAX_OUTPUT_CHARS,
-        help=f"Truncate stdout/stderr to this many characters (default: {DEFAULT_MAX_OUTPUT_CHARS})",
+        help=f"Truncate stdout/stderr to this many chars (default: {DEFAULT_MAX_OUTPUT_CHARS})",
     )
     p_exec.add_argument(
         "--warn-unpickleable",
