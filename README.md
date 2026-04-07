@@ -1,112 +1,152 @@
-# Claude Code RLM
+# Claude Code RLM — Verilog Hardware Generation
 
-A minimal implementation of Recursive Language Models (RLM) using Claude Code as the scaffold. Implemented by [Brainqub3](https://brainqub3.com/).
+A Recursive Language Model (RLM) setup for Claude Code that generates and verifies synthesisable Verilog RTL from natural language hardware specifications.
 
-## About
-
-This repository provides a basic RLM setup that enables Claude to process documents and contexts that exceed typical context window limits. It implements the core RLM pattern where a root language model orchestrates sub-LLM calls over chunks of a large document.
-
-**This is a basic implementation** of the RLM paper. For the full research, see:
+Based on the original [Brainqub3](https://brainqub3.com/) RLM implementation and the RLM paper:
 
 > **Recursive Language Models**
-> Alex L. Zhang, Tim Kraska, Omar Khattab
-> MIT CSAIL
+> Alex L. Zhang, Tim Kraska, Omar Khattab — MIT CSAIL
 > [arXiv:2512.24601](https://arxiv.org/abs/2512.24601)
 
-*Abstract: RLMs treat long prompts as part of an external environment and allow the LLM to programmatically examine, decompose, and recursively call itself over snippets of the prompt. RLMs can handle inputs up to two orders of magnitude beyond model context windows.*
+---
 
 ## Architecture
 
-This implementation maps to the RLM paper architecture as follows:
+| RLM Role | Implementation | Model |
+|---|---|---|
+| Root LM (orchestrator) | Main Claude Code conversation | Claude Sonnet |
+| Summarizer sub-LM | `summarizer` subagent | Claude Haiku |
+| Coder sub-LM (haiku mode) | `coder` subagent | Claude Haiku |
+| Coder sub-LM (codev mode) | `call_codev()` in REPL | CodeV-R1-RL-Qwen-7B via vllm |
+| External environment | Persistent Python REPL (`rlm_repl.py`) | Python 3 |
+| Verifier | `verify_verilog()` / `rlm_repl.py verify` | Icarus Verilog |
 
-| RLM Concept | Implementation | Model |
-|-------------|----------------|-------|
-| Root LLM | Main Claude Code conversation | **Claude Opus 4.5** |
-| Sub-LLM (`llm_query`) | `rlm-subcall` subagent | **Claude Haiku** |
-| External Environment | Persistent Python REPL (`rlm_repl.py`) | Python 3 |
+### Generation pipeline
 
-The root LLM (Opus 4.5) orchestrates the overall task, while delegating chunk-level analysis to the faster, lighter sub-LLM (Haiku). The Python REPL maintains state across invocations and provides utilities for chunking, searching, and managing the large context.
+```
+Spec
+ │
+ ▼
+[Root Agent] ── decompose spec ──► architectural plan
+ │
+ ▼
+[Summarizer] ── scan existing .v files ──► Module Contract (ports, params, timing)
+ │
+ ▼
+[Coder: haiku or codev] ── generate RTL ──► TopModule.v
+ │
+ ▼
+[Verifier: iverilog] ── syntax/elaboration check
+ │  ▲
+ │  └── error? feed back to Coder (recursive correction)
+ ▼
+[Root Agent] ── wire sub-modules ──► top-level wrapper + final verify
+```
+
+---
 
 ## Prerequisites
 
-- **Claude Code account** - You need access to [Claude Code](https://claude.ai/claude-code), Anthropic's official CLI tool
-- **Python 3** - For the persistent REPL environment
+- [Claude Code](https://claude.ai/claude-code) CLI installed and authenticated
+- Python 3
+- Icarus Verilog (`iverilog` and `vvp` on `PATH`)
+- *(codev mode only)* A running [vllm](https://github.com/vllm-project/vllm) server serving `zhuyaoyu/CodeV-R1-RL-Qwen-7B`
+
+---
 
 ## Usage
 
-1. **Clone this repository**
-   ```bash
-   git clone https://github.com/Brainqub3/claude_code_RLM.git
-   cd claude_code_RLM
-   ```
-
-2. **Start Claude Code in the repository directory**
-   ```bash
-   claude
-   ```
-
-3. **Run the RLM skill**
-   ```
-   /rlm
-   ```
-
-4. **Follow the prompts** - The skill will ask for:
-   - A path to your large context file
-   - Your query/question about the content
-
-The RLM workflow will then:
-- Initialize the REPL with your context
-- Chunk the document appropriately
-- Delegate chunk analysis to the sub-LLM
-- Synthesize results in the main conversation
-
-## Working with Long Files
-
-When using RLM to process large context files, it is recommended to save them in a dedicated `context/` folder within this project directory. This keeps your working files organized and separate from the RLM implementation code.
+### Interactive (single module)
 
 ```bash
-mkdir context
-# Place your large documents here, e.g.:
-# context/my_large_document.txt
-# context/codebase_dump.py
+cd rtl-code-gen-with-rlm
+claude
 ```
 
-## Security Warning
+Then inside the session:
 
-**This project is not intended for production use.**
+```
+/rlm spec=path/to/spec.txt mode=haiku
+```
 
-If you plan to run Claude Code in `--dangerously-skip-permissions` mode:
+or for CodeV:
 
-1. **Ensure your setup is correct** - Verify all file paths and configurations before enabling this mode
-2. **Run in an isolated folder** - Never run with skipped permissions in directories containing sensitive data, credentials, or system files
-3. **Understand the risks** - This mode allows Claude to execute commands without confirmation prompts, which can lead to unintended file modifications or deletions
+```
+/rlm spec=path/to/spec.txt mode=codev server_url=http://localhost:8000
+```
 
-**Recommended**: Create a dedicated, isolated working directory specifically for RLM tasks when using dangerous mode:
+### Benchmark (automated, verilog-eval dataset)
 
 ```bash
-# Example: Create an isolated workspace
-mkdir ~/rlm-workspace
-cd ~/rlm-workspace
-git clone https://github.com/Brainqub3/claude_code_RLM.git
-cd claude_code_RLM
+# Run all 156 problems in haiku mode
+python benchmark.py --mode haiku
+
+# Run 10 problems in CodeV mode
+python benchmark.py --mode codev --server-url http://localhost:8000 --limit 10
+
+# Resume from problem 42
+python benchmark.py --mode haiku --start-from 42
+
+# Full options
+python benchmark.py --help
 ```
 
-## Repository Structure
+Results are written to `results.csv`. Generated files and full session traces are saved to `generated/<problem_name>/`.
+
+---
+
+## Repository structure
 
 ```
 .
-├── CLAUDE.md                          # Project instructions for Claude Code
-├── .claude/
-│   ├── agents/
-│   │   └── rlm-subcall.md            # Sub-LLM agent definition (Haiku)
-│   └── skills/
-│       └── rlm/
-│           ├── SKILL.md              # RLM skill definition
-│           └── scripts/
-│               └── rlm_repl.py       # Persistent Python REPL
-├── context/                           # Recommended location for large context files
-└── README.md
+├── CLAUDE.md                              # Instructions read by Claude during every session
+├── benchmark.py                           # Automated benchmark runner
+├── generated/                             # Per-problem outputs (created at runtime)
+│   └── <ProbXXX_name>/
+│       ├── TopModule.v                    # Copy of the generated Verilog
+│       ├── claude_trace.txt               # Human-readable session trace
+│       └── claude_trace.jsonl             # Raw stream-json events (NDJSON)
+├── results.csv                            # pass@1 results (created at runtime)
+└── .claude/
+    ├── agents/
+    │   ├── rlm-subcall.md                 # Summarizer sub-agent (Haiku)
+    │   └── coder.md                       # Coder sub-agent (Haiku)
+    └── skills/
+        └── rlm/
+            ├── SKILL.md                   # /rlm skill definition
+            └── scripts/
+                └── rlm_repl.py            # Persistent REPL: verify_verilog, call_codev
 ```
+
+---
+
+## Important: paths with spaces
+
+If your project directory contains spaces (e.g. `Winter 2026/Project/`), always invoke
+`rlm_repl.py` using its **relative path** from the workdir:
+
+```bash
+# Correct — relative path, no quoting issues
+python3 .claude/skills/rlm/scripts/rlm_repl.py verify TopModule.v
+
+# Wrong — absolute paths with spaces cause Python to misparse the script path
+python3 /home/user/Winter 2026/Project/rtl-code-gen-with-rlm/.claude/...
+```
+
+This rule is enforced in `CLAUDE.md` so the agent never constructs absolute paths.
+
+---
+
+## Security warning
+
+**This project is not intended for production use.**
+
+When running `benchmark.py` or any `claude --dangerously-skip-permissions` invocation:
+- Run inside an isolated project directory only
+- Never point the workdir at a folder containing credentials or sensitive data
+- The `--dangerously-skip-permissions` flag allows Claude to execute commands without confirmation
+
+---
 
 ## License
 

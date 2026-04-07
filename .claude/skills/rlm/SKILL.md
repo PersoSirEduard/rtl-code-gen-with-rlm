@@ -72,22 +72,48 @@ Invoke the `coder` subagent with:
 - The Module Contract from Step 2.
 - The relevant portion of the hardware specification.
 - Any constraints (clock domain, reset polarity, target paradigm).
+- The target output file path (e.g. `TopModule.v`).
 
-The subagent returns complete Verilog source. Write it to a `.v` file.
+The subagent writes the Verilog directly to disk and returns only a one-line JSON metadata summary.
+**Do not read or display the generated `.v` file.** Store the metadata in the REPL state immediately:
+
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+import json
+meta = <paste JSON summary from coder here>
+try:
+    generated_files
+except NameError:
+    generated_files = []
+generated_files.append(meta)
+buffers.append(str(meta))
+print('Stored:', meta)
+"
+```
 
 #### codev mode
 
-Call `call_codev()` in the REPL:
+Call `call_codev()` in the REPL. Write the Verilog directly to a file from within the REPL — **never print the raw code** — then store metadata in the REPL state:
 
 ```bash
 python3 .claude/skills/rlm/scripts/rlm_repl.py exec <<'PY'
+output_file = "TopModule.v"
 spec = """<hardware specification text>"""
 verilog_code = call_codev(spec, server_url="http://localhost:8000")
-print(verilog_code)
+with open(output_file, 'w') as f:
+    f.write(verilog_code)
+meta = {"file": output_file, "chars": len(verilog_code), "lines": verilog_code.count('\n') + 1}
+try:
+    generated_files
+except NameError:
+    generated_files = []
+generated_files.append(meta)
+buffers.append(str(meta))
+print(meta)
 PY
 ```
 
-Write the returned code to a `.v` file. The function automatically strips `<think>` reasoning and markdown fences.
+The function automatically strips `<think>` reasoning and markdown fences before writing. Only the metadata dict is printed to the root agent's context.
 
 ### Step 4 – Verify (ALWAYS required)
 
@@ -113,13 +139,27 @@ print(result)
 
 1. Read `result['stderr']` to identify the exact errors.
 2. Optionally invoke the `summarizer` subagent with the error log and the Module Contract to identify the mismatch.
-3. Invoke the `coder` subagent (or `call_codev()`) with:
-   - The original spec.
-   - The current (broken) Verilog.
+3. **haiku mode** — Invoke the `coder` subagent with:
+   - The original spec and Module Contract.
+   - The target output file path (same `.v` file to overwrite).
    - The full compiler error log.
    - A clear instruction to fix only the failing lines.
-4. Overwrite the `.v` file with the corrected code.
-5. Re-run Step 4. Repeat until clean.
+
+   The subagent overwrites the file and returns a JSON metadata summary. Store the correction attempt in the REPL:
+
+   ```bash
+   python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+   import json
+   meta = <paste JSON summary from coder here>
+   meta['attempt'] = 'correction'
+   buffers.append(str(meta))
+   print('Correction stored:', meta)
+   "
+   ```
+
+   **codev mode** — Re-run the REPL exec block from Step 3 (codev), passing the error context into the spec string. The file is overwritten inside the REPL. The metadata is printed and stored automatically.
+
+4. Re-run Step 4. Repeat until `"success": true`.
 
 ### Step 6 – Integrate all sub-modules
 
@@ -134,7 +174,9 @@ Once every sub-module passes verification:
 ## Guardrails
 
 - Never skip verification after writing a `.v` file.
-- Never paste large raw Verilog into the main conversation — reference file paths instead.
+- **Never read a generated `.v` file into the root agent's context** — the root agent is blinded from generated code to prevent context rot. All Verilog lives on disk and in the REPL state; only metadata (file path, line count, port count) flows back to the root agent.
+- Never paste raw Verilog into the main conversation — reference file paths and metadata only.
 - Subagents cannot spawn other subagents; all orchestration stays in the main conversation.
 - Keep generated files and REPL state under the project directory.
 - In codev mode, `call_codev()` is the only safe way to invoke the model — do not pass raw model output directly to iverilog.
+- Always check REPL state with `rlm_repl.py status --show-vars` before starting a new generation to avoid clobbering existing `generated_files` metadata.

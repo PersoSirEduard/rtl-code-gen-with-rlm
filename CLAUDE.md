@@ -36,18 +36,22 @@ It returns a **Module Contract** containing:
 
 Choose a coder mode based on user preference or task complexity:
 
-- **haiku** – Invoke the `coder` subagent (Claude Haiku). Pass the Module Contract and the hardware specification. The agent returns a complete Verilog module.
-- **codev** – Call `call_codev(prompt, server_url)` inside the REPL. This sends the specification to `zhuyaoyu/CodeV-R1-RL-Qwen-7B` running via vllm and returns only the extracted Verilog code (reasoning and tags are stripped automatically).
+- **haiku** – Invoke the `coder` subagent (Claude Haiku). Pass the Module Contract, hardware specification, and the target `.v` file path. The subagent writes the file directly to disk and returns only a JSON metadata summary (file, module name, line count, port count).
+- **codev** – Execute `call_codev(prompt, server_url)` inside a REPL `exec` block. The REPL writes the file to disk and prints only metadata. Reasoning and markdown fences are stripped automatically before writing.
 
-**RLM Execution Rule**:
-The Root Agent is **FORBIDDEN** from generating Verilog code blocks in its main response.
+**RLM Execution Rules**:
+- The Root Agent is **FORBIDDEN** from generating Verilog code blocks in its main response.
+- The Root Agent is **FORBIDDEN** from reading generated `.v` files — all Verilog stays on disk and in the REPL state. Only metadata (file path, line/port counts) flows back to the root agent.
+- ALL generated `.v` files **MUST** be written directly to the working directory root (e.g. `TopModule.v`), never inside subdirectories.
+- **ALWAYS use the relative path** `python3 .claude/skills/rlm/scripts/rlm_repl.py` — never construct an absolute path. Absolute paths break when the project directory contains spaces.
+- After each generation step, store the returned metadata in the REPL (`generated_files` list in globals + `buffers`). Use `rlm_repl.py status --show-vars` to inspect REPL state at any time.
 
 ### 4. Verification (ALWAYS required after writing any .v file)
 
 After writing **any** `.v` file, immediately verify it:
 
 ```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py verify <file.v>
+python3 .claude/skills/rlm/scripts/rlm_repl.py verify TopModule.v
 ```
 
 Or within a REPL `exec` block:
@@ -62,11 +66,11 @@ A clean compilation returns `{"success": true, ...}`. Never skip this step.
 ### 5. Recursive Correction (Feedback Loop)
 
 If verification fails:
-1. The Root Agent reads the compiler error output.
+1. The Root Agent reads the compiler error output (stderr only — never the Verilog source).
 2. Optionally, ask the `summarizer` subagent to compare the error against the Module Contract to identify the mismatched interface.
-3. Ask the `coder` subagent (or call `call_codev()`) to fix the specific failing lines, providing the full error log.
-4. Write the corrected file and run verification again.
-5. Repeat until `"success": true`.
+3. Ask the `coder` subagent (or re-run `call_codev()` in the REPL) to fix the specific failing lines, providing the full error log and the same target file path to overwrite.
+4. The subagent/REPL writes the corrected file directly. Store the correction metadata in the REPL state.
+5. Re-run verification. Repeat until `"success": true`.
 
 ### 6. Integration & Final Assembly (Root Agent)
 
