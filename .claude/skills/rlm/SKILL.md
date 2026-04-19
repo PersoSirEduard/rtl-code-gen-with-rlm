@@ -14,9 +14,10 @@ Use this Skill when the user asks you to implement hardware described in natural
 
 - **Root Agent** = Strategic Programmatic Architect. Orchestrates all phases via REPL exec blocks. Never generates Verilog directly. Never reads `.v` files into its context.
 - **`workbench`** = persistent dict (pickled to disk). Single source of truth for all LLM outputs, generated code, and intermediate results.
-- **`workbench["prompt"]`** = systemic RLM context loaded automatically from `prompt.txt` on first exec. Prepended to every `sub_llm` and `generate_rtl` call.
-- **`sub_llm(input, target_key)`** = general-purpose Claude Haiku call. Stores text output in `workbench[target_key]["source"]`. Used for planning, interface description, and debugging.
-- **`generate_rtl(spec, mode, target_key)`** = RTL generation. Stores raw Verilog in `workbench[target_key]["source"]`. Never prints the Verilog.
+- **`workbench["system"]`** = RTL assistant role instructions only (from `system_prompt.txt`). Loaded on first exec. Prepended automatically to every `sub_llm` call.
+- **`workbench["prompt"]`** = role instructions + hardware spec (from `prompt.txt`). Loaded on first exec. Prepended automatically to every `generate_rtl` call.
+- **`sub_llm(input, target_key)`** = general-purpose Claude Haiku call. Prepends `workbench["system"]` (role only — **no hardware spec**). Pass the spec explicitly in `input` when the call needs it (Phase 1 planning). Stores text output in `workbench[target_key]["source"]`.
+- **`generate_rtl(spec, mode, target_key)`** = RTL generation. Prepends `workbench["prompt"]` (role + spec) automatically. Stores raw Verilog in `workbench[target_key]["source"]`. Never prints the Verilog.
 - **`write(filename, source_key)`** / **`read(filename, target_key)`** = move data between workbench and disk.
 - **`verify_verilog(file_path)`** = iverilog syntax/elaboration check.
 
@@ -37,18 +38,19 @@ or populated manually for ad-hoc runs). Do not ask the user for the spec.
 ### Phase 1 — Holistic Planning
 
 Do not generate any code yet. Do not use the `Read` tool on any file.
-**Do not call `status` before this step** — `workbench["prompt"]` is loaded lazily on
-the first `exec` call, so `status` before exec will always show "not yet loaded" even
-though `prompt.txt` is ready on disk.
+**Do not call `status` before this step** — workbench keys are loaded lazily on the
+first `exec` call.
 
-The hardware specification is already in `prompt.txt`. Issue the Phase 1 `exec` call
-directly — the REPL will load `prompt.txt` into `workbench["prompt"]` automatically:
+`sub_llm` only prepends the role instructions (`workbench["system"]`), not the hardware
+spec. For planning you must pass the spec explicitly inside the exec block by reading it
+from `workbench["prompt"]` and concatenating it with the planning task:
 
 ```bash
 python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+spec = workbench['prompt']
 meta = sub_llm(
-    'Based on the hardware specification in your context, produce a concise '
-    'implementation plan covering:\n'
+    spec + '\n\n'
+    'Produce a concise implementation plan covering:\n'
     '1. Sub-module decomposition: name, paradigm '
     '(combinatorial/sequential/behavioral/structural), one-sentence description\n'
     '2. Port maps: for each module list all ports with name, direction, width, '
@@ -61,7 +63,24 @@ print(meta)
 "
 ```
 
-`workbench['plan']['source']` now contains the full architectural plan.
+`print(meta)` returns only `{"key": "plan", "length": <int>}`.
+**The plan text stays in the workbench — never print it back to the root context.**
+
+Immediately after, extract module names in the same exec block so Phase 2 knows what to generate without ever printing the plan:
+
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+meta = sub_llm(
+    workbench['plan']['source'] + '\n\n'
+    'List only the Verilog module names from this plan as a compact JSON array. '
+    'Example: [\"Adder\", \"TopModule\"]. Output nothing else.',
+    target_key='modules'
+)
+print(workbench['modules']['source'])
+"
+```
+
+This prints a short JSON array like `["TopModule"]` or `["ALU", "Ctrl", "TopModule"]`. This is the **only** workbench source value you may print — it is compact extracted metadata, not plan content. Use these names to drive Phase 2.
 
 ---
 
@@ -159,6 +178,7 @@ Verify the top-level file (Phase 3). Report the list of generated files to the u
 ## Guardrails
 
 - **Never read a `.v` file into the root agent's context.** Use `workbench[key]['source']` inside exec blocks for any source inspection.
+- **Never print workbench source content to the root context.** This means no `print(plan[:N])`, no `print(src)`, no slice of plan/spec/Verilog strings. The only permitted print of a workbench source value is `print(workbench['modules']['source'])` — the compact JSON module-name list extracted at the end of Phase 1. Everything else must stay inside the exec block.
 - **Never generate a Verilog code block in the main conversation.** All RTL generation goes through `generate_rtl()` or `sub_llm()`.
 - **All exec stdout is capped at 2000 chars.** Print only metadata dicts and short diagnostic strings.
 - **Never skip Phase 3** after writing any `.v` file.

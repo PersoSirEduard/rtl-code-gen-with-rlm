@@ -7,7 +7,8 @@ This repository implements a **Zero-Footprint Recursive Language Model (RLM)** f
 Components:
 - **Skill**: `/rlm` in `.claude/skills/rlm/`
 - **Persistent REPL**: `.claude/skills/rlm/scripts/rlm_repl.py`
-- **Systemic context + spec**: `prompt.txt` (written per-run by the benchmark as `system_prompt.txt` + problem spec; loaded automatically into `workbench["prompt"]` on first exec so every `sub_llm` / `generate_rtl` call has the full spec in context)
+- **Role context**: `system_prompt.txt` → loaded into `workbench["system"]` on first exec. Used by `sub_llm` (planning, debugging). Contains RTL assistant role instructions only — **no hardware spec**.
+- **Full context**: `prompt.txt` (system_prompt.txt + hardware spec) → loaded into `workbench["prompt"]` on first exec. Used exclusively by `generate_rtl` so the sub-LLM has the spec when producing Verilog.
 
 Run the `/rlm` skill when asked to implement hardware.
 
@@ -28,14 +29,18 @@ The workbench is the single source of truth. All LLM outputs, generated code, an
 ### Phase 1 — Holistic Planning
 
 Do not generate any code. Do not use the `Read` tool on any file. The hardware
-specification is already in `workbench["prompt"]` — loaded from `prompt.txt` on first
-exec. Issue a **single** `sub_llm` call that produces the full implementation plan:
+specification lives in `workbench["prompt"]` (loaded from `prompt.txt` on first exec)
+but must **not** be read into the root agent's context.
+
+Pass the spec to the sub-LLM by reading it from the workbench inside the exec block
+and embedding it directly in the `input_string`:
 
 ```bash
 python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+spec = workbench['prompt']
 meta = sub_llm(
-    'Based on the hardware specification in your context, produce a concise '
-    'implementation plan covering:\n'
+    spec + '\n\n'
+    'Produce a concise implementation plan covering:\n'
     '1. Sub-module decomposition: name, paradigm '
     '(combinatorial/sequential/behavioral/structural), one-sentence description\n'
     '2. Port maps: for each module list all ports with name, direction, width, '
@@ -48,7 +53,8 @@ print(meta)
 "
 ```
 
-`workbench['plan']['source']` now contains the full architectural plan.
+`print(meta)` returns only `{"key": "plan", "length": <int>}` — the plan text stays
+inside the workbench. **Do NOT print `workbench['plan']['source']` or any slice of it.**
 
 ### Phase 2 — Programmatic Execution
 
@@ -70,7 +76,7 @@ print(meta)
 Repeat for each sub-module. Use distinct `target_key` values so all sources persist simultaneously in the workbench.
 
 **Mode selection**:
-- `mode='haiku'` — Claude Haiku via the CLI. Uses `workbench['prompt']` as systemic context.
+- `mode='haiku'` — Claude Haiku via the CLI. Uses `workbench['prompt']` (system + spec) as context.
 - `mode='codev'` — CodeV-R1 via vllm. Set `workbench['server_url']` before calling.
 
 ### Phase 3 — Module Verification
@@ -114,6 +120,7 @@ Then re-run Phase 3. Repeat until `"success": true`.
 ## Context Constraints (STRICT)
 
 - **Never `Read` a generated `.v` file into chat.** Source is accessible only via `workbench[key]['source']` inside exec blocks.
+- **Never print workbench source content to the main context.** This includes `print(workbench[key]['source'])`, `print(plan[:N])`, `print(src)`, or any slice of any workbench string. Only `print(meta)` (the metadata dict returned by `sub_llm` / `generate_rtl`) is permitted.
 - **All printed output from exec is capped at 2000 characters** by the REPL. Print only metadata dicts and short diagnostic strings.
 - **Never generate a Verilog code block in the main conversation.** All RTL generation goes through `generate_rtl()` or `sub_llm()`.
 - Check workbench state at any time with:

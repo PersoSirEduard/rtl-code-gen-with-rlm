@@ -63,6 +63,7 @@ from typing import Any, Dict, List
 DEFAULT_STATE_PATH = Path(".claude/rlm_state/state.pkl")
 DEFAULT_MAX_OUTPUT_CHARS = 2000
 DEFAULT_PROMPT_FILE = Path("prompt.txt")
+DEFAULT_SYSTEM_FILE = Path("system_prompt.txt")
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
@@ -297,8 +298,29 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
     workbench: Dict[str, Any] = state.setdefault("workbench", {})
 
     # ------------------------------------------------------------------
-    # Initialise systemic context from prompt.txt on first exec
+    # Initialise systemic context on first exec.
+    #
+    # workbench["system"] — role instructions only (system_prompt.txt).
+    #                       Used as the base context for sub_llm calls so
+    #                       that the hardware spec never leaks into planning
+    #                       or debugging turns unless the orchestrator
+    #                       explicitly passes it in the input string.
+    #
+    # workbench["prompt"] — system_prompt.txt + hardware spec (prompt.txt).
+    #                       Used exclusively by generate_rtl so the sub-LLM
+    #                       has the full spec when producing Verilog.
     # ------------------------------------------------------------------
+    if "system" not in workbench:
+        system_file = Path(args.system_file)
+        if system_file.exists():
+            workbench["system"] = system_file.read_text(encoding="utf-8")
+        else:
+            workbench["system"] = ""
+            sys.stderr.write(
+                f"WARNING: {args.system_file} not found. "
+                "workbench['system'] initialised to empty string.\n"
+            )
+
     if "prompt" not in workbench:
         prompt_file = Path(args.prompt_file)
         if prompt_file.exists():
@@ -315,8 +337,13 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
     # ------------------------------------------------------------------
 
     def sub_llm(input_string: str, target_key: str = "last_result") -> Dict[str, Any]:
-        """Concatenate ``workbench['prompt']`` + *input_string*, call Claude Haiku,
+        """Concatenate ``workbench['system']`` + *input_string*, call Claude Haiku,
         and store the text output in ``workbench[target_key]['source']``.
+
+        Uses the role-instructions-only system context so that the hardware spec
+        does NOT leak into planning or debugging turns.  If the orchestrator needs
+        the spec to be part of a specific call it should include the relevant
+        section explicitly in *input_string*.
 
         Args:
             input_string: The task or question to send to the model.
@@ -325,7 +352,7 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
         Returns:
             ``{"key": target_key, "length": <int>}``
         """
-        full_prompt = workbench.get("prompt", "") + "\n\n" + input_string
+        full_prompt = workbench.get("system", "") + "\n\n" + input_string
         result = subprocess.run(
             [
                 "claude",
@@ -601,8 +628,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument(
         "--prompt-file",
         default=str(DEFAULT_PROMPT_FILE),
-        help=f"Systemic context file loaded into workbench['prompt'] on first exec "
-             f"(default: {DEFAULT_PROMPT_FILE})",
+        help=f"Full context file (system + spec) loaded into workbench['prompt'] "
+             f"for generate_rtl (default: {DEFAULT_PROMPT_FILE})",
+    )
+    p_exec.add_argument(
+        "--system-file",
+        default=str(DEFAULT_SYSTEM_FILE),
+        help=f"Role-instructions-only file loaded into workbench['system'] "
+             f"for sub_llm (default: {DEFAULT_SYSTEM_FILE})",
     )
     p_exec.set_defaults(func=cmd_exec)
 
