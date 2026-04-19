@@ -1,2 +1,7 @@
 # RLM state (persistent REPL)
 .claude/rlm_state/
+__pycache__/
+*.png
+*.csv
+*.vcd
+generated_*/

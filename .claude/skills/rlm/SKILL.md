@@ -1,182 +1,169 @@
 ---
 name: rlm
-description: Run the RLM hardware generation workflow to produce verified Verilog from a natural language specification. Orchestrates decomposition, context distillation, RTL generation, and iterative verification.
+description: Run the Zero-Footprint RLM hardware generation workflow to produce verified Verilog from a natural language specification. Orchestrates holistic planning, programmatic RTL generation, verification, and recursive debugging — all through the persistent workbench REPL.
 allowed-tools:
   - Read
-  - Write
-  - Edit
-  - Grep
-  - Glob
   - Bash
-  - Agent
 ---
 
-# rlm (Recursive Language Model – Verilog Hardware Generation)
+# rlm (Zero-Footprint Recursive Language Model — Verilog Hardware Generation)
 
 Use this Skill when the user asks you to implement hardware described in natural language.
 
 ## Mental model
 
-- **Root Agent** (main Claude Code conversation) = architect and orchestrator.
-- **`summarizer` subagent** = context distillation; reads existing Verilog and docs, returns Module Contracts.
-- **`coder` subagent** = RTL generation in haiku mode.
-- **`call_codev()` in REPL** = RTL generation in codev mode (hardware-specialist LLM).
-- **`verify_verilog()` in REPL** = Icarus Verilog syntax/elaboration check.
-- **Persistent REPL** (`rlm_repl.py`) = stateful Python environment for tool calls and state.
+- **Root Agent** = Strategic Programmatic Architect. Orchestrates all phases via REPL exec blocks. Never generates Verilog directly. Never reads `.v` files into its context.
+- **`workbench`** = persistent dict (pickled to disk). Single source of truth for all LLM outputs, generated code, and intermediate results.
+- **`workbench["prompt"]`** = systemic RLM context loaded automatically from `prompt.txt` on first exec. Prepended to every `sub_llm` and `generate_rtl` call.
+- **`sub_llm(input, target_key)`** = general-purpose Claude Haiku call. Stores text output in `workbench[target_key]["source"]`. Used for planning, interface description, and debugging.
+- **`generate_rtl(spec, mode, target_key)`** = RTL generation. Stores raw Verilog in `workbench[target_key]["source"]`. Never prints the Verilog.
+- **`write(filename, source_key)`** / **`read(filename, target_key)`** = move data between workbench and disk.
+- **`verify_verilog(file_path)`** = iverilog syntax/elaboration check.
 
 ## Inputs
 
 Accept these from `$ARGUMENTS` or ask the user:
-- `spec=<description or file path>` (required): the hardware specification.
-- `mode=haiku|codev` (optional, default `haiku`): coder backend.
-- `server_url=<url>` (required when mode is `codev`): base URL of the vllm server.
+- `mode=haiku|codev` (optional, default `haiku`): RTL generation backend.
+- `server_url=<url>` (required when `mode=codev`): base URL of the vllm server.
+
+The hardware specification is **not** passed as an argument. It is already loaded into
+`workbench["prompt"]` from `prompt.txt` (written by the benchmark before each session,
+or populated manually for ad-hoc runs). Do not ask the user for the spec.
 
 ---
 
 ## Step-by-step procedure
 
-### Step 1 – Decompose the specification
+### Phase 1 — Holistic Planning
 
-Read the hardware spec and produce a written architectural plan:
-- List all sub-modules with their paradigm (combinatorial / sequential / behavioral / structural).
-- Identify global signals: clocks, resets, bus protocols, data widths.
-- Determine port hierarchy and dependencies between sub-modules.
+Do not generate any code yet. Do not use the `Read` tool on any file.
+**Do not call `status` before this step** — `workbench["prompt"]` is loaded lazily on
+the first `exec` call, so `status` before exec will always show "not yet loaded" even
+though `prompt.txt` is ready on disk.
 
-Do not generate any code yet.
-
-### Step 2 – Distil context (Summarizer sub-agent)
-
-For each sub-module, check whether related Verilog files already exist in the project:
-
-```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py status
-```
-
-If existing `.v` files are relevant, invoke the `summarizer` subagent:
-- Pass the file path(s) and a description of what the new module must interface with.
-- The subagent returns a **Module Contract** (ports, parameters, timing constraints).
-
-Store the Module Contract in the REPL state:
+The hardware specification is already in `prompt.txt`. Issue the Phase 1 `exec` call
+directly — the REPL will load `prompt.txt` into `workbench["prompt"]` automatically:
 
 ```bash
 python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
-buffers.append('''<module_contract_text>''')
-"
-```
-
-### Step 3 – Generate RTL (Coder sub-agent)
-
-#### haiku mode
-
-Invoke the `coder` subagent with:
-- The Module Contract from Step 2.
-- The relevant portion of the hardware specification.
-- Any constraints (clock domain, reset polarity, target paradigm).
-- The target output file path (e.g. `TopModule.v`).
-
-The subagent writes the Verilog directly to disk and returns only a one-line JSON metadata summary.
-**Do not read or display the generated `.v` file.** Store the metadata in the REPL state immediately:
-
-```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
-import json
-meta = <paste JSON summary from coder here>
-try:
-    generated_files
-except NameError:
-    generated_files = []
-generated_files.append(meta)
-buffers.append(str(meta))
-print('Stored:', meta)
-"
-```
-
-#### codev mode
-
-Call `call_codev()` in the REPL. Write the Verilog directly to a file from within the REPL — **never print the raw code** — then store metadata in the REPL state:
-
-```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py exec <<'PY'
-output_file = "TopModule.v"
-spec = """<hardware specification text>"""
-verilog_code = call_codev(spec, server_url="http://localhost:8000")
-with open(output_file, 'w') as f:
-    f.write(verilog_code)
-meta = {"file": output_file, "chars": len(verilog_code), "lines": verilog_code.count('\n') + 1}
-try:
-    generated_files
-except NameError:
-    generated_files = []
-generated_files.append(meta)
-buffers.append(str(meta))
+meta = sub_llm(
+    'Based on the hardware specification in your context, produce a concise '
+    'implementation plan covering:\n'
+    '1. Sub-module decomposition: name, paradigm '
+    '(combinatorial/sequential/behavioral/structural), one-sentence description\n'
+    '2. Port maps: for each module list all ports with name, direction, width, '
+    'clock domain, reset polarity\n'
+    '3. Architectural patterns: clock domains, reset strategy, shared signals\n\n'
+    'Be structured and concise. This plan drives all subsequent RTL generation.',
+    target_key='plan'
+)
 print(meta)
-PY
-```
-
-The function automatically strips `<think>` reasoning and markdown fences before writing. Only the metadata dict is printed to the root agent's context.
-
-### Step 4 – Verify (ALWAYS required)
-
-After writing **any** `.v` file:
-
-```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py verify <file.v>
-```
-
-A zero exit code and `"success": true` means the file is clean. A non-zero exit code means errors were found — proceed to Step 5.
-
-You can also verify inside an exec block and capture the result for the feedback loop:
-
-```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
-result = verify_verilog('path/to/module.v')
-buffers.append(str(result))
-print(result)
 "
 ```
 
-### Step 5 – Recursive correction (if verification fails)
+`workbench['plan']['source']` now contains the full architectural plan.
 
-1. Read `result['stderr']` to identify the exact errors.
-2. Optionally invoke the `summarizer` subagent with the error log and the Module Contract to identify the mismatch.
-3. **haiku mode** — Invoke the `coder` subagent with:
-   - The original spec and Module Contract.
-   - The target output file path (same `.v` file to overwrite).
-   - The full compiler error log.
-   - A clear instruction to fix only the failing lines.
+---
 
-   The subagent overwrites the file and returns a JSON metadata summary. Store the correction attempt in the REPL:
+### Phase 2 — Programmatic Execution
 
-   ```bash
-   python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
-   import json
-   meta = <paste JSON summary from coder here>
-   meta['attempt'] = 'correction'
-   buffers.append(str(meta))
-   print('Correction stored:', meta)
-   "
-   ```
+For each sub-module identified in the plan, feed `workbench['plan']['source']` into
+`generate_rtl` along with a focused task string. Use Python string concatenation freely
+to build the prompt — including slicing or reformatting plan sections as needed.
 
-   **codev mode** — Re-run the REPL exec block from Step 3 (codev), passing the error context into the spec string. The file is overwritten inside the REPL. The metadata is printed and stored automatically.
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+spec = (
+    workbench['plan']['source'] + '\n\n'
+    'Generate the <ModuleName> module only, as described in the plan above.'
+)
+meta = generate_rtl(spec, mode='haiku', target_key='<module_key>')
+print(meta)
+"
+```
 
-4. Re-run Step 4. Repeat until `"success": true`.
+**For codev mode**, set `server_url` first:
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+workbench['server_url'] = 'http://localhost:8000'
+spec = workbench['plan']['source'] + '\n\nGenerate the <ModuleName> module.'
+meta = generate_rtl(spec, mode='codev', target_key='<module_key>')
+print(meta)
+"
+```
 
-### Step 6 – Integrate all sub-modules
+Repeat for each sub-module with a unique `target_key` (e.g. `'alu'`, `'ctrl'`, `'regfile'`).
 
-Once every sub-module passes verification:
-1. Generate a top-level wrapper module that instantiates all sub-modules.
-2. Wire ports according to the architectural plan from Step 1.
-3. Verify the top-level file (Step 4).
-4. Report success to the user with the list of generated files.
+---
+
+### Phase 3 — Module Verification
+
+After generating each module, immediately write it to disk and verify. Never skip this step.
+
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+print(write('<ModuleName>.v', '<module_key>'))
+result = verify_verilog('<ModuleName>.v')
+print({'success': result['success'], 'stderr_len': len(result['stderr'])})
+"
+```
+
+A `"success": true` response means the file is clean. Proceed to the next sub-module or to final integration. A `"success": false` response means proceed to Phase 4.
+
+---
+
+### Phase 4 — Recursive Debugging
+
+Feed the error log and workbench source back into `sub_llm` using Python string concatenation. Use `extract_verilog` to parse the corrected module out of the text response.
+
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+result = verify_verilog('<ModuleName>.v')
+err = result['stderr']
+src = workbench['<module_key>']['source']
+meta = sub_llm(
+    'Fix the following Verilog module. Return only the corrected module in a '
+    '```verilog``` block. Fix only the failing lines; do not restructure unrelated logic.\n\n'
+    'Source:\n' + src + '\n\nCompiler errors:\n' + err,
+    target_key='<module_key>'
+)
+workbench['<module_key>']['source'] = extract_verilog(workbench['<module_key>']['source'])
+print(meta)
+"
+```
+
+Then write the corrected source to disk and re-run Phase 3. Repeat until `"success": true`.
+
+---
+
+### Final Integration
+
+Once every sub-module passes verification, generate the top-level wrapper:
+
+```bash
+python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+top_spec = (
+    workbench['plan']['source'] + '\n\n'
+    'Generate the top-level wrapper module that instantiates and wires all '
+    'sub-modules according to the plan above.'
+)
+meta = generate_rtl(top_spec, mode='haiku', target_key='top')
+print(meta)
+"
+```
+
+Verify the top-level file (Phase 3). Report the list of generated files to the user.
 
 ---
 
 ## Guardrails
 
-- Never skip verification after writing a `.v` file.
-- **Never read a generated `.v` file into the root agent's context** — the root agent is blinded from generated code to prevent context rot. All Verilog lives on disk and in the REPL state; only metadata (file path, line count, port count) flows back to the root agent.
-- Never paste raw Verilog into the main conversation — reference file paths and metadata only.
-- Subagents cannot spawn other subagents; all orchestration stays in the main conversation.
-- Keep generated files and REPL state under the project directory.
-- In codev mode, `call_codev()` is the only safe way to invoke the model — do not pass raw model output directly to iverilog.
-- Always check REPL state with `rlm_repl.py status --show-vars` before starting a new generation to avoid clobbering existing `generated_files` metadata.
+- **Never read a `.v` file into the root agent's context.** Use `workbench[key]['source']` inside exec blocks for any source inspection.
+- **Never generate a Verilog code block in the main conversation.** All RTL generation goes through `generate_rtl()` or `sub_llm()`.
+- **All exec stdout is capped at 2000 chars.** Print only metadata dicts and short diagnostic strings.
+- **Never skip Phase 3** after writing any `.v` file.
+- In codev mode, `generate_rtl(..., mode='codev')` is the only safe way to call the model — it strips `<think>` reasoning and markdown fences before storing the source.
+- Use `status --show-keys` to inspect the workbench **after** Phase 1 has run. Do not call `status` as a first action — `workbench["prompt"]` is loaded lazily on first `exec` and `status` before exec will show "not yet loaded" even though `prompt.txt` is ready on disk:
+  ```bash
+  python3 .claude/skills/rlm/scripts/rlm_repl.py status --show-keys
+  ```

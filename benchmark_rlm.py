@@ -3,12 +3,22 @@
 Benchmark runner for RTL code generation using the RLM Claude agent.
 
 For each problem in the verilog-eval dataset:
-  1. Call `claude -p "/rlm ..."` with stream-json output to capture the full trace.
-  2. Detect newly generated .v/.sv files.
-  3. Compile and run iverilog + vvp simulation against the test harness.
-  4. Record pass@1, mismatches, total samples, and session duration in results.csv.
-  5. Copy generated files and traces to generated/<problem_name>/.
-  6. Remove generated .v/.sv files from the workdir.
+  1. Reset the REPL workbench state (delete state.pkl) so each problem starts clean.
+  2. Call `claude -p "/rlm ..."` with stream-json output to capture the full trace.
+     The /rlm skill orchestrates holistic planning, generate_rtl, verification,
+     and recursive debugging entirely through the persistent workbench REPL.
+     The root agent never reads raw Verilog — only metadata flows through its context.
+  3. Detect newly generated .v/.sv files written by the REPL's write() function.
+  4. Compile and run iverilog + vvp simulation against the test harness.
+  5. Record pass@1, mismatches, total samples, and session duration in results.csv.
+  6. Copy generated files and traces to generated/<problem_name>/.
+  7. Remove generated .v/.sv files from the workdir.
+
+Prerequisites:
+  - prompt.txt must exist in the project root (systemic RLM context).
+    The REPL loads this into workbench["prompt"] on first exec per session.
+  - iverilog and vvp must be on PATH.
+  - For codev mode: a vllm server must be running at --server-url.
 
 Usage:
   python benchmark.py --mode haiku
@@ -25,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -34,9 +45,16 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 DATASET_DIR = SCRIPT_DIR.parent / "verilog-eval" / "dataset_spec-to-rtl"
-GENERATED_DIR = SCRIPT_DIR / "generated"
-RESULTS_CSV = SCRIPT_DIR / "results.csv"
+GENERATED_DIR = SCRIPT_DIR / "generated_rlm"
+RESULTS_CSV = SCRIPT_DIR / "results_rlm.csv"
+# Workbench state pickle — deleted before each problem so the REPL starts clean
+# and reloads workbench["prompt"] from prompt.txt for every session.
 RLM_STATE = SCRIPT_DIR / ".claude" / "rlm_state" / "state.pkl"
+# Fixed systemic LLM instructions — never modified during a benchmark run.
+SYSTEM_PROMPT_FILE = SCRIPT_DIR / "system_prompt.txt"
+# Written per-problem by the benchmark: system_prompt.txt + problem spec.
+# The REPL loads this into workbench["prompt"] on first exec each session.
+PROMPT_FILE = SCRIPT_DIR / "prompt.txt"
 
 CSV_FIELDS = [
     "problem",
@@ -46,6 +64,8 @@ CSV_FIELDS = [
     "total_samples",
     "duration_s",
     "claude_exit_ok",
+    "peak_input_tokens",
+    "total_input_tokens",
     "error",
 ]
 
@@ -72,51 +92,146 @@ def find_problems(dataset_dir: Path) -> list[dict]:
 # Claude invocation
 # ---------------------------------------------------------------------------
 
+def _progress(elapsed: float, msg: str) -> None:
+    """Print a single indented progress line with elapsed time."""
+    print(f"  [{elapsed:6.1f}s] {msg}", flush=True)
+
+
 def call_claude_rlm(
-    prompt_path: Path,
     mode: str,
     server_url: str | None,
     workdir: Path,
     timeout: int,
-) -> tuple[bool, float, str, str]:
+) -> tuple[bool, float, str, str, int, int]:
     """
     Run `claude -p '/rlm ...'` with stream-json output and return
-    (exit_ok, duration_s, raw_jsonl, stderr).
+    (exit_ok, duration_s, raw_jsonl, stderr,
+     peak_input_tokens, total_input_tokens).
 
-    stream-json emits one JSON object per line for every event in the session:
-    assistant messages, tool calls, tool results, and the final result.
-    This gives us the complete execution trace.
+    peak_input_tokens  — largest input_tokens seen across all assistant turns,
+                         reflecting how large the root-agent context grew.
+    total_input_tokens — input_tokens reported in the final result event.
+
+    Streams NDJSON events line-by-line so progress is printed in real time.
+    The hardware spec is already baked into prompt.txt before this is called.
     """
-    spec_arg = f"spec={prompt_path}"
     mode_arg = f"mode={mode}"
     extra = f" server_url={server_url}" if server_url else ""
-    message = f"/rlm {spec_arg} {mode_arg}{extra}"
+    message = f"/rlm {mode_arg}{extra}"
 
     cmd = [
         "claude",
         "--dangerously-skip-permissions",
         "--output-format", "stream-json",
         "--verbose",
+        "--model", "claude-sonnet-4-6",
         "-p", message,
     ]
 
     start = time.monotonic()
+    jsonl_lines: list[str] = []
+    stderr_lines: list[str] = []
+    peak_input_tokens = 0
+    total_input_tokens = 0
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(workdir),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
         )
-        duration = time.monotonic() - start
-        return result.returncode == 0, duration, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        duration = time.monotonic() - start
-        return False, duration, "", f"TIMEOUT after {timeout}s"
     except FileNotFoundError:
         duration = time.monotonic() - start
-        return False, duration, "", "ERROR: `claude` binary not found in PATH"
+        return False, duration, "", "ERROR: `claude` binary not found in PATH", 0, 0
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                duration = time.monotonic() - start
+                stderr_thread.join(timeout=2)
+                return (
+                    False, duration, "\n".join(jsonl_lines),
+                    f"TIMEOUT after {timeout}s",
+                    peak_input_tokens, total_input_tokens,
+                )
+
+            raw_line = raw_line.rstrip("\n")
+            if not raw_line:
+                continue
+            jsonl_lines.append(raw_line)
+
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+
+            elapsed = time.monotonic() - start
+            etype = event.get("type", "")
+
+            if etype == "system" and event.get("subtype") == "init":
+                _progress(elapsed, "session started")
+
+            elif etype == "assistant":
+                usage = event.get("message", {}).get("usage", {})
+                it = usage.get("input_tokens", 0)
+                if it > peak_input_tokens:
+                    peak_input_tokens = it
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use" and block.get("name") == "Bash":
+                        cmd_str = block.get("input", {}).get("command", "")
+                        m = re.search(r"rlm_repl\.py\s+(\w+)", cmd_str)
+                        subcmd = m.group(1) if m else "bash"
+                        detail = ""
+                        if subcmd == "exec":
+                            code_match = re.search(r'(?:meta\s*=\s*(\w+)|print\((\w+))', cmd_str)
+                            if code_match:
+                                fn = code_match.group(1) or code_match.group(2)
+                                detail = f" → {fn}(…)"
+                        _progress(elapsed, f"tool:Bash  rlm_repl {subcmd}{detail}")
+
+            elif etype == "user":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_result":
+                        content = block.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                c.get("text", "") for c in content if isinstance(c, dict)
+                            )
+                        content = str(content).strip().replace("\n", " ")
+                        if content and len(content) > 2:
+                            _progress(elapsed, f"  result: {content[:120]}")
+
+            elif etype == "result":
+                subtype = event.get("subtype", "")
+                cost = event.get("cost_usd")
+                cost_str = f"  ${cost:.4f}" if cost is not None else ""
+                total_input_tokens = event.get("usage", {}).get("input_tokens", 0)
+                _progress(elapsed, f"session done  subtype={subtype}{cost_str}"
+                          f"  in={total_input_tokens}")
+
+    except KeyboardInterrupt:
+        proc.kill()
+        raise
+
+    proc.wait()
+    stderr_thread.join(timeout=5)
+    duration = time.monotonic() - start
+    return (
+        proc.returncode == 0, duration, "\n".join(jsonl_lines),
+        "".join(stderr_lines), peak_input_tokens, total_input_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +438,15 @@ def run_benchmark(
 ) -> None:
     generated_dir.mkdir(parents=True, exist_ok=True)
 
+    if not SYSTEM_PROMPT_FILE.exists():
+        sys.exit(
+            f"ERROR: {SYSTEM_PROMPT_FILE} not found.\n"
+            "This file contains the fixed systemic RLM instructions.\n"
+            "The benchmark prepends it to each problem's spec and writes the\n"
+            "combined result to prompt.txt before each session."
+        )
+    system_prompt = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+
     write_header = not results_csv.exists()
     total = len(problems)
     passed_count = 0
@@ -336,18 +460,30 @@ def run_benchmark(
             name = prob["name"]
             print(f"\n[{i}/{total}] {name}  mode={mode}", flush=True)
 
-            # Reset REPL state so each session starts clean
+            # Write prompt.txt = systemic instructions + this problem's spec.
+            # The REPL loads prompt.txt into workbench["prompt"] on first exec,
+            # so the full spec is automatically part of every sub_llm /
+            # generate_rtl call without the root agent ever seeing it directly.
+            spec_text = prob["prompt"].read_text(encoding="utf-8")
+            PROMPT_FILE.write_text(
+                system_prompt
+                + "\n\n---\n\n## Hardware Specification\n\n"
+                + spec_text,
+                encoding="utf-8",
+            )
+
+            # Delete workbench state so the REPL starts clean for every problem.
+            # On first exec the REPL will reload workbench["prompt"] from prompt.txt.
             RLM_STATE.unlink(missing_ok=True)
 
             # Snapshot workdir before calling claude
             before = snapshot_v_files(workdir)
 
-            # --- Call claude ---
+            # --- Call claude (streams progress in real time) ---
             print("  Calling claude...", flush=True)
-            claude_ok, duration, raw_jsonl, stderr = call_claude_rlm(
-                prob["prompt"], mode, server_url, workdir, timeout
+            claude_ok, duration, raw_jsonl, stderr, peak_tok, total_tok = call_claude_rlm(
+                mode, server_url, workdir, timeout
             )
-            print(f"  Done in {duration:.1f}s  exit_ok={claude_ok}", flush=True)
 
             # --- Detect generated files ---
             new_files = find_new_v_files(workdir, before)
@@ -399,6 +535,8 @@ def run_benchmark(
                     "total_samples": sim_result["total"],
                     "duration_s": f"{duration:.2f}",
                     "claude_exit_ok": int(claude_ok),
+                    "peak_input_tokens": peak_tok,
+                    "total_input_tokens": total_tok,
                     "error": sim_result["error"][:300],
                 }
             )

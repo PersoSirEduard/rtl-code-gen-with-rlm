@@ -1,22 +1,41 @@
 #!/usr/bin/env python3
-"""Persistent mini-REPL for RLM-style Verilog hardware generation in Claude Code.
+"""Zero-Footprint RLM REPL for Verilog hardware generation in Claude Code.
 
-This script provides a stateful Python environment across invocations by
-saving a pickle file to disk. It is intentionally small and dependency-free.
+Architecture
+============
+All state lives in a persistent ``workbench`` dictionary (pickled to disk).
+The root agent is blinded from generated Verilog — source lives exclusively in
+``workbench[key]["source"]`` and on disk.  Only compact metadata dicts flow
+back to the root agent's context.
 
-Commands:
-  exec    - Execute Python code with persisted state
-  verify  - Run iverilog syntax/elaboration check on a Verilog file
-  status  - Show current state summary
-  reset   - Delete the current state file
+Workbench layout
+----------------
+  workbench["prompt"]           Systemic context loaded from prompt.txt at startup.
+  workbench["server_url"]       Optional: override vllm server URL for codev mode.
+  workbench[<target_key>]       {"source": str} entry created by sub_llm /
+                                generate_rtl / read.
 
-Helpers injected into the exec environment:
-  - buffers: list[str] for storing intermediate results
-  - verify_verilog(file_path) -> dict
-  - call_codev(prompt, server_url, model="zhuyaoyu/CodeV-R1-RL-Qwen-7B") -> str
+Commands
+--------
+  exec    – Execute Python code inside the persisted workbench environment.
+  verify  – Run iverilog syntax/elaboration check on a Verilog file.
+  status  – Show a compact workbench key summary.
+  reset   – Delete the current state file.
 
-Security note:
-  This runs arbitrary Python via exec. Treat it like running code you wrote.
+Functions injected into exec
+----------------------------
+  workbench                           dict  – Persistent state dictionary.
+  sub_llm(input, target_key)          dict  – Call Claude Haiku; store text output.
+  generate_rtl(spec, mode, target_key) dict – Generate Verilog; store source.
+  write(filename, source_key)         dict  – Flush workbench source to disk.
+  read(filename, target_key)          dict  – Load file from disk into workbench.
+  extract_verilog(text)               str   – Parse ```verilog``` block from text.
+  verify_verilog(file_path)           dict  – iverilog -t null check.
+  call_codev(prompt, server_url)      str   – Direct CodeV API call (raw Verilog).
+
+Security note
+-------------
+  This runs arbitrary Python via exec.  Treat it like running code you wrote.
 """
 
 from __future__ import annotations
@@ -24,21 +43,28 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import os
 import pickle
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
 import traceback
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 DEFAULT_STATE_PATH = Path(".claude/rlm_state/state.pkl")
-DEFAULT_MAX_OUTPUT_CHARS = 8000
+DEFAULT_MAX_OUTPUT_CHARS = 2000
+DEFAULT_PROMPT_FILE = Path("prompt.txt")
+
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 CODEV_SYSTEM_PROMPT = (
     "You are a helpful assistant. The assistant first thinks about the reasoning "
@@ -51,10 +77,25 @@ CODEV_SYSTEM_PROMPT = (
     " module top_module(in, out, ...) ... ``` </answer>."
 )
 
+RTL_GEN_INSTRUCTION = (
+    "Generate a complete, synthesisable Verilog module that satisfies the hardware "
+    "specification below.  Return ONLY the Verilog source code inside a "
+    "```verilog ... ``` code block.  Do not include any text, explanation, or "
+    "commentary outside the code block.\n\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 class RlmReplError(RuntimeError):
     pass
 
+
+# ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
 
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,20 +103,27 @@ def _ensure_parent_dir(path: Path) -> None:
 
 def _load_state(state_path: Path) -> Dict[str, Any]:
     if not state_path.exists():
-        return {"version": 1, "buffers": [], "globals": {}}
-    with state_path.open("rb") as f:
-        state = pickle.load(f)
-    if not isinstance(state, dict):
-        raise RlmReplError(f"Corrupt state file: {state_path}")
-    return state
+        return {"version": 2, "workbench": {}}
+    try:
+        with state_path.open("rb") as f:
+            state = pickle.load(f)
+        if not isinstance(state, dict):
+            raise RlmReplError(f"Corrupt state file: {state_path}")
+        # Migrate v1 state (buffers/globals) → v2 (workbench)
+        if "workbench" not in state:
+            state = {"version": 2, "workbench": {}}
+        return state
+    except (pickle.UnpicklingError, EOFError, KeyError) as exc:
+        sys.stderr.write(f"WARNING: Could not load state ({exc}); starting fresh.\n")
+        return {"version": 2, "workbench": {}}
 
 
 def _save_state(state: Dict[str, Any], state_path: Path) -> None:
     _ensure_parent_dir(state_path)
-    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-    with tmp_path.open("wb") as f:
+    tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+    with tmp.open("wb") as f:
         pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-    tmp_path.replace(state_path)
+    tmp.replace(state_path)
 
 
 def _truncate(s: str, max_chars: int) -> str:
@@ -86,43 +134,36 @@ def _truncate(s: str, max_chars: int) -> str:
     return s[:max_chars] + f"\n... [truncated to {max_chars} chars] ...\n"
 
 
-def _is_pickleable(value: Any) -> bool:
-    try:
-        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        return True
-    except Exception:
-        return False
+# ---------------------------------------------------------------------------
+# Verilog extraction
+# ---------------------------------------------------------------------------
 
+def extract_verilog(text: str) -> str:
+    """Extract the first ```verilog ... ``` block from *text*.
 
-def _filter_pickleable(d: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    kept: Dict[str, Any] = {}
-    dropped: List[str] = []
-    for k, v in d.items():
-        if _is_pickleable(v):
-            kept[k] = v
-        else:
-            dropped.append(k)
-    return kept, dropped
+    Falls back to the raw text if no fenced block is found (so that
+    ``verify_verilog`` can report the parse failure rather than silently
+    discarding output).
+    """
+    match = re.search(r"```verilog\s*(.*?)\s*```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Core Verilog helpers (also injected into exec environment)
+# Core helpers (also injected into exec environment)
 # ---------------------------------------------------------------------------
 
 def verify_verilog(file_path: str) -> Dict[str, Any]:
     """Run ``iverilog -t null`` on *file_path* and return a result dict.
 
-    Returns:
-        {
-            "success": bool,
-            "returncode": int,
-            "stdout": str,
-            "stderr": str,
-        }
+    Returns::
 
-    A ``"success": true`` result means the file compiled without errors.
-    If ``"success": false``, pass ``"stderr"`` to the Coder sub-agent for
-    correction.
+        {"success": bool, "returncode": int, "stdout": str, "stderr": str}
+
+    ``"success": true`` means the file compiled without errors.
+    Pass ``"stderr"`` back into ``sub_llm`` for recursive correction.
     """
     result = subprocess.run(
         ["iverilog", "-t", "null", file_path],
@@ -142,23 +183,10 @@ def call_codev(
     server_url: str,
     model: str = "zhuyaoyu/CodeV-R1-RL-Qwen-7B",
 ) -> str:
-    """Call CodeV via vllm's OpenAI-compatible API and return only the Verilog code.
+    """Call CodeV via vllm's OpenAI-compatible API; return extracted Verilog.
 
-    The function strictly parses the model's response to extract code within
-    the ``\`\`\`verilog`` block inside the ``<answer>`` tags.  The ``<think>``
-    reasoning block is discarded to prevent compiler errors.
-
-    Args:
-        prompt:     Natural-language hardware specification.
-        server_url: Base URL of the vllm server (e.g. "http://localhost:8000").
-        model:      Model name served by vllm.
-
-    Returns:
-        The raw Verilog source as a string (no markdown fences, no tags).
-
-    Raises:
-        ValueError: If the model response cannot be parsed.
-        urllib.error.URLError: If the vllm server is unreachable.
+    Strips ``<think>`` reasoning and markdown fences automatically.
+    Raises ``ValueError`` if the response cannot be parsed.
     """
     payload = {
         "model": model,
@@ -183,7 +211,6 @@ def call_codev(
 
     full_text = response["choices"][0]["message"]["content"]
 
-    # Extract content inside <answer> tags only (discards <think> reasoning).
     answer_match = re.search(r"<answer>(.*?)</answer>", full_text, re.DOTALL)
     if not answer_match:
         raise ValueError(
@@ -192,8 +219,6 @@ def call_codev(
         )
 
     answer_content = answer_match.group(1)
-
-    # Extract the Verilog code block inside the answer.
     code_match = re.search(r"```verilog\s*(.*?)\s*```", answer_content, re.DOTALL)
     if not code_match:
         raise ValueError(
@@ -223,16 +248,36 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     state = _load_state(Path(args.state))
-    buffers = state.get("buffers", [])
-    g = state.get("globals", {})
+    wb = state.get("workbench", {})
 
-    print("RLM REPL status")
+    print("RLM Workbench status")
     print(f"  State file : {args.state}")
-    print(f"  Buffers    : {len(buffers)}")
-    print(f"  Persisted vars: {len(g)}")
-    if args.show_vars and g:
-        for k in sorted(g.keys()):
-            print(f"    - {k}")
+    print(f"  Keys       : {len(wb)}")
+
+    # Prompt: check workbench first, then fall back to the prompt.txt file on disk.
+    # The file exists (written by benchmark) even before the first exec, so this
+    # gives an accurate picture regardless of whether exec has been called yet.
+    if "prompt" in wb:
+        print(f"  prompt     : loaded in workbench ({len(wb['prompt'])} chars)")
+    else:
+        prompt_file = Path(args.prompt_file)
+        if prompt_file.exists():
+            disk_len = prompt_file.stat().st_size
+            print(f"  prompt     : ready on disk, not yet loaded ({disk_len} bytes) — will load on first exec")
+        else:
+            print(f"  prompt     : MISSING — {prompt_file} not found")
+
+    data_keys = [k for k in wb if k not in {"prompt", "server_url"}]
+    print(f"  Data keys  : {len(data_keys)}")
+
+    if args.show_keys and data_keys:
+        for k in sorted(data_keys):
+            entry = wb[k]
+            if isinstance(entry, dict) and "source" in entry:
+                print(f"    [{k}]  source = {len(entry['source'])} chars")
+            else:
+                print(f"    [{k}]  = {str(entry)[:80]}")
+
     return 0
 
 
@@ -246,31 +291,178 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_exec(args: argparse.Namespace) -> int:
+def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
     state_path = Path(args.state)
     state = _load_state(state_path)
+    workbench: Dict[str, Any] = state.setdefault("workbench", {})
 
-    buffers: List[str] = state.setdefault("buffers", [])
-    if not isinstance(buffers, list):
-        buffers = []
-        state["buffers"] = buffers
+    # ------------------------------------------------------------------
+    # Initialise systemic context from prompt.txt on first exec
+    # ------------------------------------------------------------------
+    if "prompt" not in workbench:
+        prompt_file = Path(args.prompt_file)
+        if prompt_file.exists():
+            workbench["prompt"] = prompt_file.read_text(encoding="utf-8")
+        else:
+            workbench["prompt"] = ""
+            sys.stderr.write(
+                f"WARNING: {args.prompt_file} not found. "
+                "workbench['prompt'] initialised to empty string.\n"
+            )
 
-    persisted: Dict[str, Any] = state.setdefault("globals", {})
-    if not isinstance(persisted, dict):
-        persisted = {}
-        state["globals"] = persisted
+    # ------------------------------------------------------------------
+    # Injected helper functions — closures over `workbench`
+    # ------------------------------------------------------------------
+
+    def sub_llm(input_string: str, target_key: str = "last_result") -> Dict[str, Any]:
+        """Concatenate ``workbench['prompt']`` + *input_string*, call Claude Haiku,
+        and store the text output in ``workbench[target_key]['source']``.
+
+        Args:
+            input_string: The task or question to send to the model.
+            target_key:   Key under which the response is stored in workbench.
+
+        Returns:
+            ``{"key": target_key, "length": <int>}``
+        """
+        full_prompt = workbench.get("prompt", "") + "\n\n" + input_string
+        result = subprocess.run(
+            [
+                "claude",
+                "--dangerously-skip-permissions",
+                "--output-format", "text",
+                "--model", HAIKU_MODEL,
+                "-p", full_prompt,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            # Run outside the project directory so claude does NOT load CLAUDE.md
+            # and does NOT try to orchestrate the RLM workflow itself.
+            cwd=tempfile.gettempdir(),
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0 and not output:
+            output = (
+                f"ERROR (rc={result.returncode}): {result.stderr.strip()[:400]}"
+            )
+        if not isinstance(workbench.get(target_key), dict):
+            workbench[target_key] = {}
+        workbench[target_key]["source"] = output
+        return {"key": target_key, "length": len(output)}
+
+    def generate_rtl(
+        spec: str,
+        mode: str = "haiku",
+        target_key: str = "last_gen",
+    ) -> Dict[str, Any]:
+        """Generate a synthesisable Verilog module from *spec*.
+
+        Modes:
+            haiku  – Calls Claude Haiku; extracts ```verilog``` block from output.
+            codev  – Calls CodeV via vllm (reads ``workbench['server_url']`` or
+                     falls back to ``http://localhost:8000``).
+
+        The raw Verilog string is stored in ``workbench[target_key]['source']``.
+
+        Returns:
+            ``{"key": target_key, "module": <name>, "lines": <int>}``
+        """
+        if mode == "haiku":
+            full_prompt = (
+                workbench.get("prompt", "")
+                + "\n\n"
+                + RTL_GEN_INSTRUCTION
+                + spec
+            )
+            result = subprocess.run(
+                [
+                    "claude",
+                    "--dangerously-skip-permissions",
+                    "--output-format", "text",
+                    "--model", HAIKU_MODEL,
+                    "-p", full_prompt,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                # Run outside the project directory so claude does NOT load CLAUDE.md
+                # and does NOT try to orchestrate the RLM workflow itself.
+                cwd=tempfile.gettempdir(),
+            )
+            if result.returncode != 0 and not result.stdout.strip():
+                raise RlmReplError(
+                    f"claude CLI failed (rc={result.returncode}): "
+                    f"{result.stderr.strip()[:400]}"
+                )
+            verilog = extract_verilog(result.stdout)
+
+        elif mode == "codev":
+            server_url = workbench.get("server_url", "http://localhost:8000")
+            verilog = call_codev(spec, server_url)
+
+        else:
+            raise RlmReplError(f"Unknown mode: {mode!r}. Choose 'haiku' or 'codev'.")
+
+        if not isinstance(workbench.get(target_key), dict):
+            workbench[target_key] = {}
+        workbench[target_key]["source"] = verilog
+
+        module_match = re.search(r"\bmodule\s+(\w+)", verilog)
+        module_name = module_match.group(1) if module_match else "unknown"
+        lines = verilog.count("\n") + 1
+        return {"key": target_key, "module": module_name, "lines": lines}
+
+    def write(filename: str, source_key: str) -> Dict[str, Any]:
+        """Write ``workbench[source_key]['source']`` to *filename* on disk.
+
+        Returns:
+            ``{"written": filename, "chars": <int>}``
+        """
+        entry = workbench.get(source_key)
+        if not isinstance(entry, dict) or "source" not in entry:
+            raise RlmReplError(
+                f"workbench[{source_key!r}]['source'] not found. "
+                "Run generate_rtl() or sub_llm() first."
+            )
+        source = entry["source"]
+        Path(filename).write_text(source, encoding="utf-8")
+        return {"written": filename, "chars": len(source)}
+
+    def read(filename: str, target_key: str) -> Dict[str, Any]:
+        """Read *filename* from disk into ``workbench[target_key]['source']``.
+
+        Returns:
+            ``{"read": filename, "chars": <int>}``
+        """
+        content = Path(filename).read_text(encoding="utf-8")
+        if not isinstance(workbench.get(target_key), dict):
+            workbench[target_key] = {}
+        workbench[target_key]["source"] = content
+        return {"read": filename, "chars": len(content)}
+
+    # ------------------------------------------------------------------
+    # Build execution environment
+    # ------------------------------------------------------------------
+    _injected = {
+        "workbench", "sub_llm", "generate_rtl", "write", "read",
+        "extract_verilog", "verify_verilog", "call_codev", "__builtins__",
+    }
+
+    env: Dict[str, Any] = {
+        "workbench": workbench,
+        "sub_llm": sub_llm,
+        "generate_rtl": generate_rtl,
+        "write": write,
+        "read": read,
+        "extract_verilog": extract_verilog,
+        "verify_verilog": verify_verilog,
+        "call_codev": call_codev,
+    }
 
     code = args.code
     if code is None:
         code = sys.stdin.read()
-
-    # Build execution environment: persisted vars + injected helpers.
-    env: Dict[str, Any] = dict(persisted)
-    env["buffers"] = buffers
-    env["verify_verilog"] = verify_verilog
-    env["call_codev"] = call_codev
-
-    injected_keys = {"__builtins__", "buffers", "verify_verilog", "call_codev"}
 
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
@@ -281,24 +473,26 @@ def cmd_exec(args: argparse.Namespace) -> int:
     except Exception:
         traceback.print_exc(file=stderr_buf)
 
-    # Pull back possibly mutated buffers.
-    maybe_buffers = env.get("buffers")
-    if isinstance(maybe_buffers, list):
-        state["buffers"] = maybe_buffers
-
-    # Persist any new variables (excluding injected keys).
-    to_persist = {k: v for k, v in env.items() if k not in injected_keys}
-    filtered, dropped = _filter_pickleable(to_persist)
-    state["globals"] = filtered
+    # ------------------------------------------------------------------
+    # Persist workbench — drop any non-pickleable values the user added
+    # ------------------------------------------------------------------
+    updated_wb = env.get("workbench", workbench)
+    if isinstance(updated_wb, dict):
+        clean: Dict[str, Any] = {}
+        for k, v in updated_wb.items():
+            try:
+                pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
+                clean[k] = v
+            except Exception:
+                stderr_buf.write(
+                    f"\nWARNING: workbench[{k!r}] is not pickleable; dropped.\n"
+                )
+        state["workbench"] = clean
 
     _save_state(state, state_path)
 
     out = stdout_buf.getvalue()
     err = stderr_buf.getvalue()
-
-    if dropped and args.warn_unpickleable:
-        msg = "Dropped unpickleable variables: " + ", ".join(dropped)
-        err = err + ("\n" if err else "") + msg + "\n"
 
     if out:
         sys.stdout.write(_truncate(out, args.max_output_chars))
@@ -318,17 +512,45 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent(
             """\
-            Persistent mini-REPL for RLM Verilog hardware generation.
+            Zero-Footprint RLM REPL for Verilog hardware generation.
 
-            Examples:
-              python rlm_repl.py verify path/to/top_module.v
-              python rlm_repl.py exec -c "result = verify_verilog('top.v'); print(result)"
-              python rlm_repl.py exec <<'PY'
-              code = call_codev('implement a 4-bit adder', 'http://localhost:8000')
-              print(code)
-              PY
-              python rlm_repl.py status
-              python rlm_repl.py reset
+            All state lives in a persistent workbench dict.  Generated Verilog is
+            stored in workbench[key]["source"] and written to disk via write().
+            The root agent only ever sees compact metadata — never raw Verilog.
+
+            Quick reference
+            ---------------
+            # Phase 1 — planning
+            python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+            meta = sub_llm('Decompose this spec: <spec>', target_key='decomp')
+            print(meta)
+            "
+
+            # Phase 2 — RTL generation
+            python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+            meta = generate_rtl('<spec>', mode='haiku', target_key='top')
+            print(meta)
+            "
+
+            # Phase 3 — write & verify
+            python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+            print(write('TopModule.v', 'top'))
+            print(verify_verilog('TopModule.v'))
+            "
+
+            # Phase 4 — recursive fix
+            python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+            err = verify_verilog('TopModule.v')['stderr']
+            src = workbench['top']['source']
+            fix_prompt = 'Fix this Verilog:\\n' + src + '\\nErrors:\\n' + err
+            meta = sub_llm(fix_prompt, target_key='top')
+            workbench['top']['source'] = extract_verilog(workbench['top']['source'])
+            print(meta)
+            "
+
+            # Inspect state
+            python3 .claude/skills/rlm/scripts/rlm_repl.py status --show-keys
+            python3 .claude/skills/rlm/scripts/rlm_repl.py reset
             """
         ),
     )
@@ -340,25 +562,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # verify
     p_verify = sub.add_parser("verify", help="Run iverilog check on a Verilog file")
-    p_verify.add_argument("file", help="Path to the .v file to verify")
+    p_verify.add_argument("file", help="Path to the .v/.sv file to verify")
     p_verify.set_defaults(func=cmd_verify)
 
-    p_status = sub.add_parser("status", help="Show current state summary")
+    # status
+    p_status = sub.add_parser("status", help="Show current workbench summary")
     p_status.add_argument(
-        "--show-vars", action="store_true", help="List persisted variable names"
+        "--show-keys", action="store_true",
+        help="List each workbench key with its source size",
+    )
+    p_status.add_argument(
+        "--prompt-file",
+        default=str(DEFAULT_PROMPT_FILE),
+        help=f"prompt.txt path to check on disk when not yet loaded in workbench "
+             f"(default: {DEFAULT_PROMPT_FILE})",
     )
     p_status.set_defaults(func=cmd_status)
 
+    # reset
     p_reset = sub.add_parser("reset", help="Delete the current state file")
     p_reset.set_defaults(func=cmd_reset)
 
-    p_exec = sub.add_parser("exec", help="Execute Python code with persisted state")
+    # exec
+    p_exec = sub.add_parser("exec", help="Execute Python with persisted workbench")
     p_exec.add_argument(
-        "-c",
-        "--code",
+        "-c", "--code",
         default=None,
-        help="Inline code string. If omitted, reads code from stdin.",
+        help="Inline code string. If omitted, reads from stdin.",
     )
     p_exec.add_argument(
         "--max-output-chars",
@@ -367,9 +599,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Truncate stdout/stderr to this many chars (default: {DEFAULT_MAX_OUTPUT_CHARS})",
     )
     p_exec.add_argument(
-        "--warn-unpickleable",
-        action="store_true",
-        help="Warn on stderr when variables could not be persisted",
+        "--prompt-file",
+        default=str(DEFAULT_PROMPT_FILE),
+        help=f"Systemic context file loaded into workbench['prompt'] on first exec "
+             f"(default: {DEFAULT_PROMPT_FILE})",
     )
     p_exec.set_defaults(func=cmd_exec)
 
@@ -379,11 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: List[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
     try:
         return int(args.func(args))
-    except RlmReplError as e:
-        sys.stderr.write(f"ERROR: {e}\n")
+    except RlmReplError as exc:
+        sys.stderr.write(f"ERROR: {exc}\n")
         return 2
 
 
