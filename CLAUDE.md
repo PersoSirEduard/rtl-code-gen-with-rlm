@@ -42,7 +42,7 @@ spec = workbench['prompt']
 meta = sub_llm(
     spec + '\n\n'
     'Begin your response with exactly one line in this format (no other text before it):\n'
-    'SUMMARY: {\"modules\": [\"Name1\", \"Name2\"], \"paradigms\": [\"combinatorial\", \"sequential\"], \"has_clock\": true, \"has_reset\": false}\n\n'
+    'SUMMARY: {\"modules\": [{\"name\": \"TopModule\", \"ports\": [{\"name\": \"clk\", \"dir\": \"input\", \"width\": 1}, {\"name\": \"out\", \"dir\": \"output\", \"width\": 8}]}]}\n\n'
     'Then produce the full implementation plan covering:\n'
     '1. Sub-module decomposition: name, paradigm, one-sentence description\n'
     '2. Port maps: for each module list all ports with name, direction, width, clock domain, reset polarity\n'
@@ -124,7 +124,7 @@ Then re-run Phase 3. Repeat until `"success": true`.
 ## Context Constraints (STRICT)
 
 - **Never `Read` a generated `.v` file into chat.** Source is accessible only via `workbench[key]['source']` inside exec blocks.
-- **Never print workbench source content to the main context.** This includes `print(workbench[key]['source'])`, `print(plan[:N])`, `print(src)`, or any slice of any workbench string. Only `print(meta)` (the metadata dict returned by `sub_llm` / `generate_rtl`) is permitted.
+- **Never print workbench source content to the main context.** This includes `print(workbench[key]['source'])`, or `print(plan[:N])`.
 - **All printed output from exec is capped at 2000 characters** by the REPL. Print only metadata dicts and short diagnostic strings.
 - **Never generate a Verilog code block in the main conversation.** All RTL generation goes through `generate_rtl()` or `sub_llm()`.
 - Check workbench state at any time with:

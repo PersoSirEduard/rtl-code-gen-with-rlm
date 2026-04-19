@@ -56,7 +56,7 @@ spec = workbench['prompt']
 meta = sub_llm(
     spec + '\n\n'
     'Begin your response with exactly one line in this format (no other text before it):\n'
-    'SUMMARY: {\"modules\": [\"Name1\", \"Name2\"], \"paradigms\": [\"combinatorial\", \"sequential\"], \"has_clock\": true, \"has_reset\": false}\n\n'
+    'SUMMARY: {\"modules\": [{\"name\": \"TopModule\", \"ports\": [{\"name\": \"clk\", \"dir\": \"input\", \"width\": 1}, {\"name\": \"out\", \"dir\": \"output\", \"width\": 8}]}, {\"name\": \"SubMod\", \"ports\": []}]}\n\n'
     'Then, on the next line, produce the full implementation plan covering:\n'
     '1. Sub-module decomposition: name, paradigm, one-sentence description\n'
     '2. Port maps: for each module list all ports with name, direction, width, clock domain, reset polarity\n'
@@ -73,8 +73,9 @@ print(summary)
 ```
 
 `print(summary)` outputs a compact dict like
-`{'modules': ['ALU', 'TopModule'], 'paradigms': ['sequential', 'structural'], 'has_clock': True, 'has_reset': True}`.
-Use `summary['modules']` to drive Phase 2. **The plan body stays in the workbench.**
+`{'modules': [{'name': 'ALU', 'ports': [{'name': 'a', 'dir': 'input', 'width': 8}, ...]}, {'name': 'TopModule', 'ports': [...]}]}`.
+Use `summary['modules']` to drive Phase 2 — iterate over names and use the port lists
+to validate generated interfaces. **The plan body stays in the workbench.**
 
 ---
 
