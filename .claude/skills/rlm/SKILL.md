@@ -43,44 +43,38 @@ first `exec` call.
 
 `sub_llm` only prepends the role instructions (`workbench["system"]`), not the hardware
 spec. For planning you must pass the spec explicitly inside the exec block by reading it
-from `workbench["prompt"]` and concatenating it with the planning task:
+from `workbench["prompt"]` and concatenating it with the planning task.
+
+Ask the model to begin its response with a machine-readable `SUMMARY:` header line,
+followed by the full plan body. The exec block parses only that header — the rest stays
+in the workbench:
 
 ```bash
 python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+import json, re
 spec = workbench['prompt']
 meta = sub_llm(
     spec + '\n\n'
-    'Produce a concise implementation plan covering:\n'
-    '1. Sub-module decomposition: name, paradigm '
-    '(combinatorial/sequential/behavioral/structural), one-sentence description\n'
-    '2. Port maps: for each module list all ports with name, direction, width, '
-    'clock domain, reset polarity\n'
+    'Begin your response with exactly one line in this format (no other text before it):\n'
+    'SUMMARY: {\"modules\": [\"Name1\", \"Name2\"], \"paradigms\": [\"combinatorial\", \"sequential\"], \"has_clock\": true, \"has_reset\": false}\n\n'
+    'Then, on the next line, produce the full implementation plan covering:\n'
+    '1. Sub-module decomposition: name, paradigm, one-sentence description\n'
+    '2. Port maps: for each module list all ports with name, direction, width, clock domain, reset polarity\n'
     '3. Architectural patterns: clock domains, reset strategy, shared signals\n\n'
-    'Be structured and concise. This plan drives all subsequent RTL generation.',
+    'Be structured and concise. The SUMMARY line must be valid JSON.',
     target_key='plan'
 )
-print(meta)
+# Programmatically parse only the summary header — never print plan body
+first_line = workbench['plan']['source'].split('\n')[0]
+m = re.match(r'SUMMARY:\s*(\{.*\})', first_line)
+summary = json.loads(m.group(1)) if m else {}
+print(summary)
 "
 ```
 
-`print(meta)` returns only `{"key": "plan", "length": <int>}`.
-**The plan text stays in the workbench — never print it back to the root context.**
-
-Immediately after, extract module names in the same exec block so Phase 2 knows what to generate without ever printing the plan:
-
-```bash
-python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
-meta = sub_llm(
-    workbench['plan']['source'] + '\n\n'
-    'List only the Verilog module names from this plan as a compact JSON array. '
-    'Example: [\"Adder\", \"TopModule\"]. Output nothing else.',
-    target_key='modules'
-)
-print(workbench['modules']['source'])
-"
-```
-
-This prints a short JSON array like `["TopModule"]` or `["ALU", "Ctrl", "TopModule"]`. This is the **only** workbench source value you may print — it is compact extracted metadata, not plan content. Use these names to drive Phase 2.
+`print(summary)` outputs a compact dict like
+`{'modules': ['ALU', 'TopModule'], 'paradigms': ['sequential', 'structural'], 'has_clock': True, 'has_reset': True}`.
+Use `summary['modules']` to drive Phase 2. **The plan body stays in the workbench.**
 
 ---
 
@@ -178,7 +172,7 @@ Verify the top-level file (Phase 3). Report the list of generated files to the u
 ## Guardrails
 
 - **Never read a `.v` file into the root agent's context.** Use `workbench[key]['source']` inside exec blocks for any source inspection.
-- **Never print workbench source content to the root context.** This means no `print(plan[:N])`, no `print(src)`, no slice of plan/spec/Verilog strings. The only permitted print of a workbench source value is `print(workbench['modules']['source'])` — the compact JSON module-name list extracted at the end of Phase 1. Everything else must stay inside the exec block.
+- **Never print workbench source content to the root context.** No `print(plan[:N])`, no `print(src)`, no slice of any plan/spec/Verilog string. The only permitted output from a workbench source is the parsed `summary` dict extracted programmatically from the `SUMMARY:` header line at the top of `workbench['plan']['source']`. Everything else must stay inside the exec block.
 - **Never generate a Verilog code block in the main conversation.** All RTL generation goes through `generate_rtl()` or `sub_llm()`.
 - **All exec stdout is capped at 2000 chars.** Print only metadata dicts and short diagnostic strings.
 - **Never skip Phase 3** after writing any `.v` file.

@@ -32,29 +32,33 @@ Do not generate any code. Do not use the `Read` tool on any file. The hardware
 specification lives in `workbench["prompt"]` (loaded from `prompt.txt` on first exec)
 but must **not** be read into the root agent's context.
 
-Pass the spec to the sub-LLM by reading it from the workbench inside the exec block
-and embedding it directly in the `input_string`:
+Pass the spec to the sub-LLM explicitly. Instruct it to begin its response with a
+machine-readable `SUMMARY:` header; parse only that line back into the root context:
 
 ```bash
 python3 .claude/skills/rlm/scripts/rlm_repl.py exec -c "
+import json, re
 spec = workbench['prompt']
 meta = sub_llm(
     spec + '\n\n'
-    'Produce a concise implementation plan covering:\n'
-    '1. Sub-module decomposition: name, paradigm '
-    '(combinatorial/sequential/behavioral/structural), one-sentence description\n'
-    '2. Port maps: for each module list all ports with name, direction, width, '
-    'clock domain, reset polarity\n'
+    'Begin your response with exactly one line in this format (no other text before it):\n'
+    'SUMMARY: {\"modules\": [\"Name1\", \"Name2\"], \"paradigms\": [\"combinatorial\", \"sequential\"], \"has_clock\": true, \"has_reset\": false}\n\n'
+    'Then produce the full implementation plan covering:\n'
+    '1. Sub-module decomposition: name, paradigm, one-sentence description\n'
+    '2. Port maps: for each module list all ports with name, direction, width, clock domain, reset polarity\n'
     '3. Architectural patterns: clock domains, reset strategy, shared signals\n\n'
-    'Be structured and concise. This plan drives all subsequent RTL generation.',
+    'The SUMMARY line must be valid JSON.',
     target_key='plan'
 )
-print(meta)
+first_line = workbench['plan']['source'].split('\n')[0]
+m = re.match(r'SUMMARY:\s*(\{.*\})', first_line)
+summary = json.loads(m.group(1)) if m else {}
+print(summary)
 "
 ```
 
-`print(meta)` returns only `{"key": "plan", "length": <int>}` — the plan text stays
-inside the workbench. **Do NOT print `workbench['plan']['source']` or any slice of it.**
+Only the parsed `summary` dict is printed. The plan body stays in the workbench.
+**Do NOT print `workbench['plan']['source']` or any slice of it.**
 
 ### Phase 2 — Programmatic Execution
 
