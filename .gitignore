@@ -5,3 +5,4 @@ __pycache__/
 *.csv
 *.vcd
 generated_*/
+!pipeline.png
