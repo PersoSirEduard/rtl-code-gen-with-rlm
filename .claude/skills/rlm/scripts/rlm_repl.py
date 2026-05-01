@@ -11,7 +11,6 @@ back to the root agent's context.
 Workbench layout
 ----------------
   workbench["prompt"]           Systemic context loaded from prompt.txt at startup.
-  workbench["server_url"]       Optional: override vllm server URL for codev mode.
   workbench[<target_key>]       {"source": str} entry created by sub_llm /
                                 generate_rtl / read.
 
@@ -24,14 +23,17 @@ Commands
 
 Functions injected into exec
 ----------------------------
-  workbench                           dict  – Persistent state dictionary.
-  sub_llm(input, target_key)          dict  – Call Claude Haiku; store text output.
-  generate_rtl(spec, mode, target_key) dict – Generate Verilog; store source.
-  write(filename, source_key)         dict  – Flush workbench source to disk.
-  read(filename, target_key)          dict  – Load file from disk into workbench.
-  extract_verilog(text)               str   – Parse ```verilog``` block from text.
-  verify_verilog(file_path)           dict  – iverilog -t null check.
-  call_codev(prompt, server_url)      str   – Direct CodeV API call (raw Verilog).
+  workbench                                   dict – Persistent state dictionary.
+  sub_llm(input, target_key)                  dict – Single Haiku call; parses
+                                                     ```summary``` JSON and
+                                                     ```output``` body; stores under
+                                                     workbench[target_key].
+  generate_rtl(spec, target_key)              dict – Single Verilog generation; same
+                                                     summary + output extraction.
+  write(filename, source_key)                 dict – Flush workbench source to disk.
+  read(filename, target_key)                  dict – Load file from disk into workbench.
+  extract_verilog(text)                       str  – Parse ```verilog``` block from text.
+  verify_verilog(file_path)                   dict – iverilog -g2012 -t null check.
 
 Security note
 -------------
@@ -50,10 +52,9 @@ import sys
 import tempfile
 import textwrap
 import traceback
-import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -65,18 +66,8 @@ DEFAULT_MAX_OUTPUT_CHARS = 2000
 DEFAULT_PROMPT_FILE = Path("prompt.txt")
 DEFAULT_SYSTEM_FILE = Path("system_prompt.txt")
 
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
-
-CODEV_SYSTEM_PROMPT = (
-    "You are a helpful assistant. The assistant first thinks about the reasoning "
-    "process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and<answer> </answer> "
-    "tags, respectively, i.e., <think> reasoning process here </think>"
-    "<answer> answer here </answer>.  Now the user asks you to write verilog code. "
-    "After thinking, when you finally reach a conclusion, enclose the final verilog "
-    "code in ```verilog ``` within <answer> </answer> tags. i.e., <answer> ```verilog\n"
-    " module top_module(in, out, ...) ... ``` </answer>."
-)
+# HAIKU_MODEL = "claude-haiku-4-5-20251001"
+HAIKU_MODEL = "claude-sonnet-4-6"
 
 RTL_GEN_INSTRUCTION = (
     "Generate a complete, synthesisable Verilog module that satisfies the hardware "
@@ -167,7 +158,7 @@ def verify_verilog(file_path: str) -> Dict[str, Any]:
     Pass ``"stderr"`` back into ``sub_llm`` for recursive correction.
     """
     result = subprocess.run(
-        ["iverilog", "-t", "null", file_path],
+        ["iverilog", "-g2012", "-t", "null", file_path],
         capture_output=True,
         text=True,
     )
@@ -179,55 +170,194 @@ def verify_verilog(file_path: str) -> Dict[str, Any]:
     }
 
 
-def call_codev(
-    prompt: str,
-    server_url: str,
-    model: str = "zhuyaoyu/CodeV-R1-RL-Qwen-7B",
-) -> str:
-    """Call CodeV via vllm's OpenAI-compatible API; return extracted Verilog.
+def _extract_assistant_result(raw_jsonl: str) -> str:
+    """Pull the final assistant text from a stream-json NDJSON stream.
 
-    Strips ``<think>`` reasoning and markdown fences automatically.
-    Raises ``ValueError`` if the response cannot be parsed.
+    Prefers the `result` event's `result` field; falls back to concatenating
+    all assistant `text` content blocks.
     """
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": CODEV_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+    for raw_line in raw_jsonl.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result" and event.get("subtype") == "success":
+            return (event.get("result") or "").strip()
+
+    parts: List[str] = []
+    for raw_line in raw_jsonl.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+    return "\n".join(parts).strip()
+
+
+def _format_trace(raw_jsonl: str) -> str:
+    """Render stream-json NDJSON as a human-readable trace.
+
+    Mirrors the format used by `benchmark_rlm.format_trace`: thinking blocks,
+    text chunks, tool calls/results, and the final result summary.
+    """
+    out: List[str] = []
+    for raw_line in raw_jsonl.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            out.append(f"[RAW] {raw_line}")
+            continue
+
+        etype = event.get("type", "")
+        if etype == "system" and event.get("subtype") == "init":
+            out.append(f"[SESSION INIT] session_id={event.get('session_id', '?')}")
+        elif etype == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                btype = block.get("type", "")
+                if btype == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        out.append(f"[ASSISTANT]\n{text}\n")
+                elif btype == "thinking":
+                    thinking = block.get("thinking", "").strip()
+                    if thinking:
+                        out.append(f"[THINKING]\n{thinking}\n")
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "?")
+                    tool_input = json.dumps(
+                        block.get("input", {}), ensure_ascii=False
+                    )
+                    if len(tool_input) > 600:
+                        tool_input = tool_input[:600] + "…"
+                    out.append(f"[TOOL CALL] {tool_name}\n{tool_input}\n")
+        elif etype == "user":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "tool_result":
+                    content = block.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            c.get("text", "") for c in content if isinstance(c, dict)
+                        )
+                    content = str(content).strip()
+                    if len(content) > 800:
+                        content = content[:800] + "…"
+                    out.append(
+                        f"[TOOL RESULT] (id={block.get('tool_use_id', '?')})\n{content}\n"
+                    )
+        elif etype == "result":
+            summary = f"[SESSION RESULT] subtype={event.get('subtype', '')}"
+            usage = event.get("usage")
+            if usage:
+                summary += f"  tokens={usage}"
+            out.append(summary)
+            result_text = (event.get("result") or "").strip()
+            if result_text:
+                out.append(f"  final_result: {result_text[:400]}")
+    return "\n".join(out)
+
+
+def _call_haiku(prompt: str, log_path: Optional[Path] = None) -> str:
+    """Single Claude Haiku call returning the assistant's final text.
+
+    Always uses ``--output-format stream-json --verbose`` so thinking and
+    intermediate steps are captured. When ``log_path`` is provided, the raw
+    NDJSON is written to ``<log_path>.jsonl`` and a human-readable rendering
+    to ``<log_path>.txt``. Logging failures are silenced.
+    """
+    result = subprocess.run(
+        [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", HAIKU_MODEL,
+            "-p", prompt,
         ],
-        "temperature": 0.0,
-        "max_tokens": 4096,
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{server_url.rstrip('/')}/v1/chat/completions",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=tempfile.gettempdir(),
     )
+    raw = result.stdout
 
-    with urllib.request.urlopen(req) as resp:
-        response = json.loads(resp.read().decode("utf-8"))
+    if log_path is not None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.with_suffix(".jsonl").write_text(raw, encoding="utf-8")
+            log_path.with_suffix(".txt").write_text(
+                _format_trace(raw), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
-    full_text = response["choices"][0]["message"]["content"]
+    output = _extract_assistant_result(raw)
+    if result.returncode != 0 and not output:
+        output = f"ERROR (rc={result.returncode}): {result.stderr.strip()[:400]}"
+    return output
 
-    answer_match = re.search(r"<answer>(.*?)</answer>", full_text, re.DOTALL)
-    if not answer_match:
-        raise ValueError(
-            "No <answer> tags found in CodeV response.\n"
-            f"Raw output (first 500 chars):\n{full_text[:500]}"
-        )
 
-    answer_content = answer_match.group(1)
-    code_match = re.search(r"```verilog\s*(.*?)\s*```", answer_content, re.DOTALL)
-    if not code_match:
-        raise ValueError(
-            "No ```verilog block found within <answer> tags.\n"
-            f"Answer content:\n{answer_content[:500]}"
-        )
+_SUMMARY_FENCE_RE = re.compile(r"```summary\s*(\{.*?\})\s*```", re.DOTALL)
+_OUTPUT_FENCE_RE = re.compile(r"```output\s*(.*?)\s*```", re.DOTALL)
 
-    return code_match.group(1).strip()
+
+def _parse_diagnostic(text: str) -> Dict[str, Any]:
+    """Extract the diagnostic JSON from the first ```summary``` fenced block.
+
+    Returns ``{}`` if no summary block is present or its body cannot be parsed
+    as JSON. Progressive suffix repair (``}``, ``]}``, ``]}}``) handles
+    models that occasionally drop closing brackets on long lines.
+
+    Calibration enforcement: if the model returns a non-empty
+    ``uncertainties`` list together with ``confidence_score >= 80`` (a
+    rubric violation — uncertain output cannot be 80+), we clamp the score
+    to 79 so the gating rule sees a consistent signal. The original score
+    is preserved in ``raw_confidence_score`` for debugging.
+    """
+    m = _SUMMARY_FENCE_RE.search(text)
+    if not m:
+        return {}
+    raw = m.group(1).strip()
+    diag: Dict[str, Any] = {}
+    for suffix in ["", "}", "]}", "]}}"]:
+        try:
+            diag = json.loads(raw + suffix)
+            break
+        except json.JSONDecodeError:
+            continue
+    if not diag:
+        return {}
+
+    uncertainties = diag.get("uncertainties") or []
+    score = diag.get("confidence_score")
+    if uncertainties and isinstance(score, (int, float)) and score >= 80:
+        diag["raw_confidence_score"] = score
+        diag["confidence_score"] = 79
+    return diag
+
+
+def _extract_content(text: str) -> str:
+    """Return the body of the first ```output``` fenced block, verbatim.
+
+    Falls back to the full response text when the model omits the output
+    fence so downstream callers (``extract_verilog``, plan parsing) can
+    still attempt to recover something useful.
+    """
+    m = _OUTPUT_FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +398,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             print(f"  prompt     : MISSING — {prompt_file} not found")
 
-    data_keys = [k for k in wb if k not in {"prompt", "server_url"}]
+    data_keys = [k for k in wb if k != "prompt"]
     print(f"  Data keys  : {len(data_keys)}")
 
     if args.show_keys and data_keys:
@@ -296,6 +426,18 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
     state_path = Path(args.state)
     state = _load_state(state_path)
     workbench: Dict[str, Any] = state.setdefault("workbench", {})
+
+    # Per-call sub_llm log directory + monotonic sequence counter.
+    # Each Haiku call writes <NNNN_target_key[_pI]>.{jsonl,txt} so the
+    # thinking + tool-call trace can be replayed for debugging.
+    log_dir = state_path.parent / "sub_llm_logs"
+
+    def _alloc_log(target_key: str) -> Path:
+        seq = state.get("sub_llm_seq", 0) + 1
+        state["sub_llm_seq"] = seq
+        # Sanitize target_key for filesystem (replace any path separators)
+        safe = re.sub(r"[^\w.-]", "_", target_key)
+        return log_dir / f"{seq:04d}_{safe}"
 
     # ------------------------------------------------------------------
     # Initialise systemic context on first exec.
@@ -336,109 +478,72 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
     # Injected helper functions — closures over `workbench`
     # ------------------------------------------------------------------
 
-    def sub_llm(input_string: str, target_key: str = "last_result") -> Dict[str, Any]:
-        """Concatenate ``workbench['system']`` + *input_string*, call Claude Haiku,
-        and store the text output in ``workbench[target_key]['source']``.
+    def sub_llm(
+        input_string: str,
+        target_key: str = "last_result",
+    ) -> Dict[str, Any]:
+        """Single Claude Haiku call. Stores content in
+        ``workbench[target_key]['source']`` and the parsed diagnostic JSON in
+        ``workbench[target_key]['diagnostic']``.
 
-        Uses the role-instructions-only system context so that the hardware spec
-        does NOT leak into planning or debugging turns.  If the orchestrator needs
-        the spec to be part of a specific call it should include the relevant
-        section explicitly in *input_string*.
-
-        Args:
-            input_string: The task or question to send to the model.
-            target_key:   Key under which the response is stored in workbench.
-
-        Returns:
-            ``{"key": target_key, "length": <int>}``
+        When the response has no ```summary``` / ```output``` fences, the full
+        text is treated as content and the diagnostic is left empty — so this
+        helper still works for summarisation-style calls (relevance check,
+        prosecutor, contract extraction).
         """
         full_prompt = workbench.get("system", "") + "\n\n" + input_string
-        result = subprocess.run(
-            [
-                "claude",
-                "--dangerously-skip-permissions",
-                "--output-format", "text",
-                "--model", HAIKU_MODEL,
-                "-p", full_prompt,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            # Run outside the project directory so claude does NOT load CLAUDE.md
-            # and does NOT try to orchestrate the RLM workflow itself.
-            cwd=tempfile.gettempdir(),
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0 and not output:
-            output = (
-                f"ERROR (rc={result.returncode}): {result.stderr.strip()[:400]}"
-            )
+        log_path = _alloc_log(target_key)
+        raw = _call_haiku(full_prompt, log_path=log_path)
+        diagnostic = _parse_diagnostic(raw)
+        content = _extract_content(raw)
+
         if not isinstance(workbench.get(target_key), dict):
             workbench[target_key] = {}
-        workbench[target_key]["source"] = output
-        return {"key": target_key, "length": len(output)}
+        workbench[target_key]["source"] = content
+        workbench[target_key]["diagnostic"] = diagnostic
+
+        return {
+            "key": target_key,
+            "length": len(content),
+            "confidence": diagnostic.get("confidence_score"),
+            "uncertainties": diagnostic.get("uncertainties", []),
+        }
 
     def generate_rtl(
         spec: str,
-        mode: str = "haiku",
         target_key: str = "last_gen",
     ) -> Dict[str, Any]:
-        """Generate a synthesisable Verilog module from *spec*.
+        """Generate a synthesisable Verilog module from *spec* via Claude Haiku.
 
-        Modes:
-            haiku  – Calls Claude Haiku; extracts ```verilog``` block from output.
-            codev  – Calls CodeV via vllm (reads ``workbench['server_url']`` or
-                     falls back to ``http://localhost:8000``).
-
-        The raw Verilog string is stored in ``workbench[target_key]['source']``.
-
-        Returns:
-            ``{"key": target_key, "module": <name>, "lines": <int>}``
+        Expects a ```summary``` + ```output``` response. The output body is
+        stored as the Verilog source.
         """
-        if mode == "haiku":
-            full_prompt = (
-                workbench.get("prompt", "")
-                + "\n\n"
-                + RTL_GEN_INSTRUCTION
-                + spec
-            )
-            result = subprocess.run(
-                [
-                    "claude",
-                    "--dangerously-skip-permissions",
-                    "--output-format", "text",
-                    "--model", HAIKU_MODEL,
-                    "-p", full_prompt,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                # Run outside the project directory so claude does NOT load CLAUDE.md
-                # and does NOT try to orchestrate the RLM workflow itself.
-                cwd=tempfile.gettempdir(),
-            )
-            if result.returncode != 0 and not result.stdout.strip():
-                raise RlmReplError(
-                    f"claude CLI failed (rc={result.returncode}): "
-                    f"{result.stderr.strip()[:400]}"
-                )
-            verilog = extract_verilog(result.stdout)
-
-        elif mode == "codev":
-            server_url = workbench.get("server_url", "http://localhost:8000")
-            verilog = call_codev(spec, server_url)
-
-        else:
-            raise RlmReplError(f"Unknown mode: {mode!r}. Choose 'haiku' or 'codev'.")
+        full_prompt = (
+            workbench.get("prompt", "")
+            + "\n\n"
+            + RTL_GEN_INSTRUCTION
+            + spec
+        )
+        log_path = _alloc_log(target_key)
+        raw = _call_haiku(full_prompt, log_path=log_path)
+        diagnostic = _parse_diagnostic(raw)
+        verilog = extract_verilog(_extract_content(raw))
 
         if not isinstance(workbench.get(target_key), dict):
             workbench[target_key] = {}
         workbench[target_key]["source"] = verilog
+        workbench[target_key]["diagnostic"] = diagnostic
 
         module_match = re.search(r"\bmodule\s+(\w+)", verilog)
         module_name = module_match.group(1) if module_match else "unknown"
         lines = verilog.count("\n") + 1
-        return {"key": target_key, "module": module_name, "lines": lines}
+        return {
+            "key": target_key,
+            "module": module_name,
+            "lines": lines,
+            "confidence": diagnostic.get("confidence_score"),
+            "uncertainties": diagnostic.get("uncertainties", []),
+        }
 
     def write(filename: str, source_key: str) -> Dict[str, Any]:
         """Write ``workbench[source_key]['source']`` to *filename* on disk.
@@ -473,7 +578,8 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
     # ------------------------------------------------------------------
     _injected = {
         "workbench", "sub_llm", "generate_rtl", "write", "read",
-        "extract_verilog", "verify_verilog", "call_codev", "__builtins__",
+        "extract_verilog", "verify_verilog",
+        "__builtins__",
     }
 
     env: Dict[str, Any] = {
@@ -484,7 +590,6 @@ def cmd_exec(args: argparse.Namespace) -> int:  # noqa: C901
         "read": read,
         "extract_verilog": extract_verilog,
         "verify_verilog": verify_verilog,
-        "call_codev": call_codev,
     }
 
     code = args.code

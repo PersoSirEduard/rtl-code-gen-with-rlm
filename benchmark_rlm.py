@@ -18,12 +18,10 @@ Prerequisites:
   - prompt.txt must exist in the project root (systemic RLM context).
     The REPL loads this into workbench["prompt"] on first exec per session.
   - iverilog and vvp must be on PATH.
-  - For codev mode: a vllm server must be running at --server-url.
 
 Usage:
-  python benchmark.py --mode haiku
-  python benchmark.py --mode codev --server-url http://localhost:8000
-  python benchmark.py --mode haiku --limit 10 --start-from 3
+  python benchmark.py
+  python benchmark.py --limit 10 --start-from 3
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -50,6 +49,7 @@ RESULTS_CSV = SCRIPT_DIR / "results_rlm.csv"
 # Workbench state pickle — deleted before each problem so the REPL starts clean
 # and reloads workbench["prompt"] from prompt.txt for every session.
 RLM_STATE = SCRIPT_DIR / ".claude" / "rlm_state" / "state.pkl"
+SUB_LLM_LOGS = SCRIPT_DIR / ".claude" / "rlm_state" / "sub_llm_logs"
 # Fixed systemic LLM instructions — never modified during a benchmark run.
 SYSTEM_PROMPT_FILE = SCRIPT_DIR / "system_prompt.txt"
 # Written per-problem by the benchmark: system_prompt.txt + problem spec.
@@ -58,7 +58,6 @@ PROMPT_FILE = SCRIPT_DIR / "prompt.txt"
 
 CSV_FIELDS = [
     "problem",
-    "mode",
     "passed",
     "mismatches",
     "total_samples",
@@ -98,13 +97,11 @@ def _progress(elapsed: float, msg: str) -> None:
 
 
 def call_claude_rlm(
-    mode: str,
-    server_url: str | None,
     workdir: Path,
     timeout: int,
 ) -> tuple[bool, float, str, str, int, int]:
     """
-    Run `claude -p '/rlm ...'` with stream-json output and return
+    Run `claude -p '/rlm'` with stream-json output and return
     (exit_ok, duration_s, raw_jsonl, stderr,
      peak_input_tokens, total_input_tokens).
 
@@ -115,9 +112,7 @@ def call_claude_rlm(
     Streams NDJSON events line-by-line so progress is printed in real time.
     The hardware spec is already baked into prompt.txt before this is called.
     """
-    mode_arg = f"mode={mode}"
-    extra = f" server_url={server_url}" if server_url else ""
-    message = f"/rlm {mode_arg}{extra}"
+    message = "/rlm"
 
     cmd = [
         "claude",
@@ -134,6 +129,11 @@ def call_claude_rlm(
     peak_input_tokens = 0
     total_input_tokens = 0
 
+    env = os.environ.copy()
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    env["BASH_MAX_TIMEOUT_MS"] = "700000"
+    env["BASH_DEFAULT_TIMEOUT_MS"] = "700000"
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -141,6 +141,7 @@ def call_claude_rlm(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
     except FileNotFoundError:
         duration = time.monotonic() - start
@@ -429,8 +430,6 @@ def run_simulation(
 
 def run_benchmark(
     problems: list[dict],
-    mode: str,
-    server_url: str | None,
     workdir: Path,
     generated_dir: Path,
     results_csv: Path,
@@ -458,7 +457,7 @@ def run_benchmark(
 
         for i, prob in enumerate(problems, 1):
             name = prob["name"]
-            print(f"\n[{i}/{total}] {name}  mode={mode}", flush=True)
+            print(f"\n[{i}/{total}] {name}", flush=True)
 
             # Write prompt.txt = systemic instructions + this problem's spec.
             # The REPL loads prompt.txt into workbench["prompt"] on first exec,
@@ -475,6 +474,9 @@ def run_benchmark(
             # Delete workbench state so the REPL starts clean for every problem.
             # On first exec the REPL will reload workbench["prompt"] from prompt.txt.
             RLM_STATE.unlink(missing_ok=True)
+            # Clear per-call sub_llm logs so they don't bleed across problems.
+            if SUB_LLM_LOGS.exists():
+                shutil.rmtree(SUB_LLM_LOGS)
 
             # Snapshot workdir before calling claude
             before = snapshot_v_files(workdir)
@@ -482,7 +484,7 @@ def run_benchmark(
             # --- Call claude (streams progress in real time) ---
             print("  Calling claude...", flush=True)
             claude_ok, duration, raw_jsonl, stderr, peak_tok, total_tok = call_claude_rlm(
-                mode, server_url, workdir, timeout
+                workdir, timeout
             )
 
             # --- Detect generated files ---
@@ -525,11 +527,14 @@ def run_benchmark(
                 encoding="utf-8",
             )
 
+            # Per-call sub_llm traces (one .jsonl + .txt per Haiku invocation)
+            if SUB_LLM_LOGS.exists():
+                shutil.copytree(SUB_LLM_LOGS, dest / "sub_llm_logs", dirs_exist_ok=True)
+
             # --- Write CSV row ---
             writer.writerow(
                 {
                     "problem": name,
-                    "mode": mode,
                     "passed": int(passed),
                     "mismatches": sim_result["mismatches"],
                     "total_samples": sim_result["total"],
@@ -561,18 +566,6 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--mode",
-        choices=["haiku", "codev"],
-        default="haiku",
-        help="Coder mode to pass to /rlm",
-    )
-    parser.add_argument(
-        "--server-url",
-        default=None,
-        metavar="URL",
-        help="vllm server base URL (required for codev mode, e.g. http://localhost:8000)",
-    )
-    parser.add_argument(
         "--dataset-dir",
         type=Path,
         default=DATASET_DIR,
@@ -593,7 +586,7 @@ def main() -> None:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=2000,
         help="Per-problem claude session timeout in seconds",
     )
     parser.add_argument(
@@ -612,9 +605,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.mode == "codev" and not args.server_url:
-        parser.error("--server-url is required when --mode codev")
-
     dataset_dir = args.dataset_dir.resolve()
     if not dataset_dir.exists():
         sys.exit(f"ERROR: dataset dir not found: {dataset_dir}")
@@ -631,12 +621,10 @@ def main() -> None:
 
     print(f"Found {len(problems)} problems, running {len(selected)} "
           f"(start={args.start_from}, limit={args.limit})")
-    print(f"Mode: {args.mode}  workdir: {SCRIPT_DIR}")
+    print(f"Workdir: {SCRIPT_DIR}")
 
     run_benchmark(
         problems=selected,
-        mode=args.mode,
-        server_url=args.server_url,
         workdir=SCRIPT_DIR,
         generated_dir=args.generated_dir.resolve(),
         results_csv=args.results_csv.resolve(),
